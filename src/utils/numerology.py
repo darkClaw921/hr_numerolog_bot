@@ -157,16 +157,30 @@ def calculate_sector_coefficient(matrix: Dict[int, List[int]], sectors: List[int
 
 def calculate_destiny_number(date_str: str) -> int:
     """
-    Вычисляет Число Судьбы: сумма всех цифр даты до однозначного числа.
+    Вычисляет Число Судьбы: сумма всех цифр даты.
+    Если получается 11, останавливается и возвращает 11 (мастер-число).
+    Иначе приводит к однозначному числу.
     
     Args:
         date_str: Дата в формате DD.MM.YYYY
         
     Returns:
-        Число Судьбы (1-9)
+        Число Судьбы (1-9 или 11)
     """
     first_add = calculate_first_additional(date_str)
-    return sum_digits(first_add)
+    # Если первое дополнительное число уже однозначное, возвращаем его
+    if first_add < 10:
+        return first_add
+    
+    # Суммируем цифры первого дополнительного числа
+    result = sum(int(d) for d in str(first_add))
+    
+    # Если получилось 11, останавливаемся (мастер-число)
+    if result == 11:
+        return 11
+    
+    # Иначе приводим к однозначному
+    return sum_digits(result)
 
 
 def calculate_all(date_str: str) -> Dict:
@@ -206,10 +220,10 @@ def calculate_all(date_str: str) -> Dict:
     matrix = fill_matrix(date_str, first_additional, second_additional, 
                         third_additional, fourth_additional)
     
-    # Шаг 6: Сектор плотское (3/5/7 по диагонали)
+    # Шаг 6: Сектор темперамент (3/5/7 по диагонали)
     # В матрице 3x3: сектор 3 (верхний правый), 5 (центр), 7 (нижний левый)
     # Но по описанию это диагональ, значит: 3, 5, 7
-    sector_physical = calculate_sector_coefficient(matrix, [3, 5, 7])
+    sector_temperament = calculate_sector_coefficient(matrix, [3, 5, 7])
     
     # Шаг 7: Сектор быт (4/5/6)
     sector_life = calculate_sector_coefficient(matrix, [4, 5, 6])
@@ -230,7 +244,7 @@ def calculate_all(date_str: str) -> Dict:
         "third_additional": third_additional,
         "fourth_additional": fourth_additional,
         "matrix": matrix,
-        "sector_physical": sector_physical,
+        "sector_temperament": sector_temperament,
         "sector_life": sector_life,
         "sector_purpose": sector_purpose,
         "sector_family": sector_family,
