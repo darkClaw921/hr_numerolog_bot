@@ -5,8 +5,55 @@ from aiogram import Router, F
 from aiogram.types import Message
 from aiogram.filters import Command
 from src.utils.numerology import calculate_all, parse_date
+from src.utils.interpretations import get_all_interpretations, get_additional_qualities
+
+# Максимальная длина сообщения в Telegram (4096 символов, оставляем запас)
+MAX_MESSAGE_LENGTH = 4000
 
 router = Router()
+
+
+async def send_long_message(message: Message, text: str, parse_mode: str = "HTML"):
+    """
+    Отправляет длинное сообщение, разбивая его на части если необходимо.
+    
+    Args:
+        message: Объект сообщения для ответа
+        text: Текст для отправки
+        parse_mode: Режим парсинга (HTML или None)
+    """
+    if len(text) <= MAX_MESSAGE_LENGTH:
+        await message.answer(text, parse_mode=parse_mode)
+        return
+    
+    # Разбиваем текст на части
+    parts = []
+    current_part = ""
+    
+    # Разбиваем по строкам, чтобы не разрывать HTML теги
+    lines = text.split('\n')
+    
+    for line in lines:
+        # Если добавление строки не превысит лимит
+        if len(current_part) + len(line) + 1 <= MAX_MESSAGE_LENGTH:
+            current_part += line + '\n'
+        else:
+            # Сохраняем текущую часть и начинаем новую
+            if current_part:
+                parts.append(current_part.strip())
+            current_part = line + '\n'
+    
+    # Добавляем последнюю часть
+    if current_part:
+        parts.append(current_part.strip())
+    
+    # Отправляем все части
+    for i, part in enumerate(parts):
+        if i == 0:
+            await message.answer(part, parse_mode=parse_mode)
+        else:
+            # Добавляем номер части для удобства
+            await message.answer(f"<i>(продолжение {i + 1}/{len(parts)})</i>\n\n{part}", parse_mode=parse_mode)
 
 
 @router.message(Command("start"))
@@ -56,10 +103,17 @@ async def process_date(message: Message):
         # Выполняем расчеты
         results = calculate_all(date_str)
         
-        # Формируем ответ
-        response = format_results(results)
+        # Формируем основной ответ (без интерпретаций секторов)
+        response = format_results_basic(results)
+        await send_long_message(message, response, parse_mode="HTML")
         
-        await message.answer(response, parse_mode="HTML")
+        # Отправляем интерпретации секторов отдельными сообщениями
+        interpretations = get_all_interpretations(results)
+        await send_sector_interpretations(message, interpretations)
+        
+        # Получаем и отправляем дополнительные качества отдельным сообщением
+        additional_qualities = get_additional_qualities(results)
+        await send_additional_qualities(message, additional_qualities)
         
     except ValueError as e:
         await message.answer(f"❌ Ошибка: {str(e)}")
@@ -67,15 +121,67 @@ async def process_date(message: Message):
         await message.answer(f"❌ Произошла ошибка при расчетах: {str(e)}")
 
 
-def format_results(results: dict) -> str:
+async def send_sector_interpretations(message: Message, interpretations: dict):
     """
-    Форматирует результаты расчетов для вывода пользователю.
+    Отправляет интерпретации секторов отдельными сообщениями.
+    
+    Args:
+        message: Объект сообщения для ответа
+        interpretations: Словарь с интерпретациями секторов
+    """
+    sector_names = {
+        "character": "1. ХАРАКТЕР (Тип восприятия)",
+        "energy": "2. ЭНЕРГИЯ",
+        "interest": "3. ИНТЕРЕС",
+        "health": "4. ЗДОРОВЬЕ",
+        "logic": "5. ЛОГИКА",
+        "labor": "6. ТРУД",
+        "luck": "7. УДАЧА",
+        "duty": "8. ДОЛГ",
+        "memory": "9. ПАМЯТЬ"
+    }
+    
+    await message.answer("📖 <b>ИНТЕРПРЕТАЦИИ СЕКТОРОВ:</b>", parse_mode="HTML")
+    
+    for key, name in sector_names.items():
+        text = f"<b>{name}</b>\n{interpretations[key]}"
+        await send_long_message(message, text, parse_mode="HTML")
+
+
+async def send_additional_qualities(message: Message, qualities: dict):
+    """
+    Отправляет дополнительные качества отдельными сообщениями.
+    
+    Args:
+        message: Объект сообщения для ответа
+        qualities: Словарь с интерпретациями дополнительных качеств
+    """
+    await message.answer("📚 <b>ДОПОЛНИТЕЛЬНЫЕ КАЧЕСТВА:</b>", parse_mode="HTML")
+    
+    quality_names = {
+        "life": "БЫТ",
+        "temperament": "ПЛОТСКОЕ (Темперамент)",
+        "family": "СЕМЬЯ",
+        "stability": "СТАБИЛЬНОСТЬ",
+        "purpose": "ЦЕЛЕУСТРЕМЛЕННОСТЬ",
+        "transformation": "ТРАНСФОРМАЦИЯ",
+        "destiny_number": "ЧИСЛО СУДЬБЫ (профессиональный вектор)"
+    }
+    
+    for key, name in quality_names.items():
+        text = f"<b>{name}</b>\n{qualities[key]}"
+        await send_long_message(message, text, parse_mode="HTML")
+
+
+def format_results_basic(results: dict) -> str:
+    """
+    Форматирует основные результаты расчетов без интерпретаций секторов.
     
     Args:
         results: Словарь с результатами расчетов
         
     Returns:
-        Отформатированная строка с результатами
+        Отформатированная строка с основными результатами
     """
     matrix = results["matrix"]
     
@@ -107,3 +213,5 @@ def format_results(results: dict) -> str:
     )
     
     return response
+
+
