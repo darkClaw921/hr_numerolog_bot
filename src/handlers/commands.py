@@ -6,6 +6,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.filters import Command
 from src.utils.numerology import calculate_all, parse_date
 from src.utils.interpretations import get_all_interpretations, get_additional_qualities
+from src.utils.combinations import get_matching_combinations
 
 # Максимальная длина сообщения в Telegram (4096 символов, оставляем запас)
 MAX_MESSAGE_LENGTH = 4000
@@ -171,7 +172,13 @@ def create_inline_keyboard() -> InlineKeyboardMarkup:
             quality_row = []
     if quality_row:
         buttons.append(quality_row)
-    
+
+    # Отдельная кнопка для комбинаций секторов
+    buttons.append([InlineKeyboardButton(
+        text="🧩 Комбинации",
+        callback_data="combos:show"
+    )])
+
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -379,6 +386,46 @@ async def handle_quality_callback(callback: CallbackQuery):
             parse_mode="HTML",
             reply_markup=keyboard
         )
+
+
+@router.callback_query(F.data == "combos:show")
+async def handle_combos_callback(callback: CallbackQuery):
+    """Обработчик нажатия на кнопку 'Комбинации'."""
+    await callback.answer()
+
+    message_id = callback.message.message_id
+
+    if message_id not in _results_cache:
+        await callback.message.answer(
+            "❌ Ошибка: данные расчётов не найдены. Пожалуйста, отправьте дату заново.",
+            parse_mode="HTML"
+        )
+        return
+
+    cache_data = _results_cache[message_id]
+    results = cache_data['results']
+    date = cache_data['date']
+
+    matches = get_matching_combinations(results)
+
+    if not matches:
+        await callback.message.answer(
+            f"🧩 <b>Комбинации для {date}</b>\n\n"
+            "По текущим коэффициентам подходящих комбинаций не выявлено.",
+            parse_mode="HTML"
+        )
+        return
+
+    # Группируем тексты по разделам для удобного чтения
+    text = f"🧩 <b>Комбинации для {date}</b>\n\n"
+    current_group = None
+    for group, combo_text in matches:
+        if group != current_group:
+            text += f"\n<b>🔹 {group}</b>\n\n"
+            current_group = group
+        text += f"• {combo_text}\n\n"
+
+    await send_long_message(callback.message, text)
 
 
 @router.callback_query(F.data == "back:main")
