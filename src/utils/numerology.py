@@ -1,9 +1,24 @@
 """
 Модуль для нумерологических расчетов по дате рождения.
 Реализует алгоритм расчета матрицы и дополнительных чисел.
+
+Это источник истины алгоритма. Модуль не зависит от aiogram/БД и пригоден для
+переиспользования будущим ботом совместимости (через общий пакет или копию).
 """
 from typing import Dict, List, Tuple
-from datetime import datetime
+from datetime import datetime, date
+
+# Версия алгоритма расчёта. Хранится вместе со снапшотом результата в БД, чтобы
+# бот совместимости мог определить устаревший кэш и пересчитать из даты рождения.
+CALC_VERSION = 1
+
+# Ключи коэффициентов секторов, которые обязаны присутствовать в результате.
+REQUIRED_COEF_KEYS = (
+    "sector_temperament",
+    "sector_life",
+    "sector_purpose",
+    "sector_family",
+)
 
 
 def parse_date(date_str: str) -> Tuple[int, int, int]:
@@ -250,3 +265,46 @@ def calculate_all(date_str: str) -> Dict:
         "sector_family": sector_family,
         "destiny_number": destiny_number
     }
+
+
+def format_date_for_calc(value: date) -> str:
+    """
+    Превращает объект date в строку DD.MM.YYYY с ведущими нулями.
+
+    Алгоритм расчёта чувствителен к строковому представлению (нули в дне/месяце
+    влияют на сумму цифр), поэтому дату из БД нужно форматировать детерминированно
+    именно так, как её вводит пользователь (regex ^\\d{2}\\.\\d{2}\\.\\d{4}$).
+
+    Args:
+        value: дата рождения как datetime.date
+
+    Returns:
+        Строка в формате DD.MM.YYYY
+    """
+    return value.strftime("%d.%m.%Y")
+
+
+def validate_results(results: Dict) -> None:
+    """
+    Проверяет полноту результатов расчёта перед показом/сохранением.
+
+    Закрывает пункт ТЗ «коэффициенты секторов проверяем на полноту»: гарантирует,
+    что все коэффициенты посчитаны, матрица содержит все 9 секторов, а Число Судьбы
+    присутствует. Защищает от KeyError/None в форматировании, отчёте и кабинете.
+
+    Args:
+        results: словарь из calculate_all()
+
+    Raises:
+        ValueError: если результаты неполны или некорректны
+    """
+    missing = [k for k in REQUIRED_COEF_KEYS if results.get(k) is None]
+    if missing:
+        raise ValueError(f"Не посчитаны коэффициенты секторов: {', '.join(missing)}")
+
+    matrix = results.get("matrix")
+    if not isinstance(matrix, dict) or set(matrix.keys()) != set(range(1, 10)):
+        raise ValueError("Матрица неполна: ожидаются секторы 1-9")
+
+    if results.get("destiny_number") is None:
+        raise ValueError("Не посчитано Число Судьбы")

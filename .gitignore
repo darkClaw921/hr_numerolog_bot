@@ -8,4 +8,10 @@ venv/
 env/
 .venv
 *.log
+
+# Файлы БД SQLite
+*.db
+*.db-wal
+*.db-shm
+
 Тексты для нумеролог бота.md
