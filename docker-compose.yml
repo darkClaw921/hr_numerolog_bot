@@ -1,0 +1,8 @@
+services:
+  bot:
+    build: .
+    container_name: hr-numerolog-bot
+    env_file: .env
+    volumes:
+      - ./data:/data
+    restart: unless-stopped

@@ -1,0 +1,13 @@
+.venv
+.git
+.claude
+__pycache__
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+.env
+.DS_Store
+Лекция*
+Тексты*
+Тз*
