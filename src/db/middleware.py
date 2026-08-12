@@ -54,6 +54,10 @@ class DbSessionMiddleware(BaseMiddleware):
                     last_name=tg_user.last_name,
                     language_code=tg_user.language_code,
                 )
+                # Коммитим регистрацию сразу: иначе write-блокировка SQLite
+                # держится весь хендлер (включая ожидание ответов Telegram API),
+                # и параллельные апдейты падают с "database is locked".
+                await session.commit()
 
             try:
                 result = await handler(event, data)

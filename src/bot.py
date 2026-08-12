@@ -5,6 +5,7 @@ import logging
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
@@ -27,6 +28,9 @@ async def main():
 
     bot = Bot(
         token=BOT_TOKEN,
+        # 25с вместо 60с по умолчанию: сеть до api.telegram.org нестабильна,
+        # зависший запрос должен падать быстро, чтобы повтор пользователя прошёл.
+        session=AiohttpSession(timeout=25),
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher(storage=MemoryStorage())

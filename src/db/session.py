@@ -17,7 +17,9 @@ from src.db import models  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
-engine = create_async_engine(DATABASE_URL, future=True)
+# timeout=30: ждём снятия блокировки до 30с вместо 5с по умолчанию — записи
+# конкурируют, когда несколько апдейтов обрабатываются одновременно.
+engine = create_async_engine(DATABASE_URL, future=True, connect_args={"timeout": 30})
 
 
 @event.listens_for(engine.sync_engine, "connect")
@@ -26,6 +28,7 @@ def _set_sqlite_pragma(dbapi_connection, connection_record):
     cursor = dbapi_connection.cursor()
     try:
         cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
         cursor.execute("PRAGMA foreign_keys=ON")
     finally:
         cursor.close()
