@@ -8,6 +8,8 @@ from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject, Update
 
 from src.db.repositories import (
+    PaymentIntentRepo,
+    PaymentRepo,
     PersonRepo,
     SearchHistoryRepo,
     SubscriptionRepo,
@@ -42,6 +44,8 @@ class DbSessionMiddleware(BaseMiddleware):
             data["person_repo"] = PersonRepo(session)
             data["history_repo"] = SearchHistoryRepo(session)
             data["subscription_repo"] = SubscriptionRepo(session)
+            data["intent_repo"] = PaymentIntentRepo(session)
+            data["payment_repo"] = PaymentRepo(session)
 
             tg_user = data.get("event_from_user")
             if tg_user is None and isinstance(event, Update):

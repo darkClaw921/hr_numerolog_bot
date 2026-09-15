@@ -4,9 +4,18 @@
 from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db.models import BotUser, CompatibilityResult, Person, SearchHistory, Subscription
+from src.db.models import (
+    BotUser,
+    CompatibilityResult,
+    Payment,
+    PaymentIntent,
+    Person,
+    SearchHistory,
+    Subscription,
+)
 
 
 def _utcnow() -> datetime:
@@ -177,6 +186,126 @@ class SubscriptionRepo:
             sub.started_at = now if is_premium else sub.started_at
             sub.expires_at = expires_at
         return sub
+
+    async def apply_prodamus_payment(
+        self,
+        user_id: int,
+        *,
+        expires_at: datetime,
+        next_payment_at: datetime | None = None,
+        prodamus_subscription_id: str | None = None,
+        customer_phone: str | None = None,
+        customer_email: str | None = None,
+        plan: str = "premium_monthly",
+    ) -> Subscription:
+        """Включает/продлевает премиум по успешному платежу Prodamus."""
+        sub = await self.get(user_id)
+        now = _utcnow()
+        if sub is None:
+            sub = Subscription(user_id=user_id, is_premium=True, plan=plan, started_at=now)
+            self.session.add(sub)
+        sub.is_premium = True
+        sub.plan = plan
+        sub.started_at = sub.started_at or now
+        sub.expires_at = expires_at
+        sub.provider = "prodamus"
+        sub.prodamus_active = True
+        # Успешное списание отменяет прошлую отмену автопродления.
+        sub.cancelled_at = None
+        sub.last_payment_at = now
+        sub.next_payment_at = next_payment_at
+        if prodamus_subscription_id:
+            sub.prodamus_subscription_id = prodamus_subscription_id
+        if customer_phone:
+            sub.prodamus_customer_phone = customer_phone
+        if customer_email:
+            sub.prodamus_customer_email = customer_email
+        await self.session.flush()
+        return sub
+
+    async def mark_cancelled(self, user_id: int) -> Subscription | None:
+        """
+        Отключает автопродление. is_premium и expires_at НЕ трогаем: оплаченный
+        период дорабатывает до конца, дальше доступ снимет сам is_active().
+        """
+        sub = await self.get(user_id)
+        if sub is None:
+            return None
+        sub.prodamus_active = False
+        sub.cancelled_at = _utcnow()
+        await self.session.flush()
+        return sub
+
+    async def find_by_phone(self, phone: str) -> Subscription | None:
+        result = await self.session.execute(
+            select(Subscription).where(Subscription.prodamus_customer_phone == phone)
+        )
+        return result.scalars().first()
+
+    async def find_by_email(self, email: str) -> Subscription | None:
+        result = await self.session.execute(
+            select(Subscription).where(Subscription.prodamus_customer_email == email)
+        )
+        return result.scalars().first()
+
+
+class PaymentIntentRepo:
+    """Намерения оплаты: связывают выданный ботом order_id с пользователем."""
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def create(self, user_id: int, order_id: str, amount_rub: float | None = None) -> PaymentIntent:
+        intent = PaymentIntent(user_id=user_id, order_id=order_id, amount_rub=amount_rub)
+        self.session.add(intent)
+        await self.session.flush()
+        return intent
+
+    async def get_by_order_id(self, order_id: str) -> PaymentIntent | None:
+        result = await self.session.execute(
+            select(PaymentIntent).where(PaymentIntent.order_id == order_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def mark_paid(self, intent: PaymentIntent) -> None:
+        intent.paid_at = _utcnow()
+        await self.session.flush()
+
+
+class PaymentRepo:
+    """Журнал платёжных событий; event_key обеспечивает идемпотентность вебхука."""
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def add_event(self, **fields) -> Payment | None:
+        """
+        Пишет событие. Возвращает None, если событие с таким event_key уже было
+        (повторная доставка уведомления) — вызывающий код тогда ничего не меняет.
+        """
+        payment = Payment(**fields)
+        self.session.add(payment)
+        try:
+            await self.session.flush()
+        except IntegrityError:
+            await self.session.rollback()
+            return None
+        return payment
+
+    async def get_by_event_key(self, event_key: str) -> Payment | None:
+        result = await self.session.execute(
+            select(Payment).where(Payment.event_key == event_key)
+        )
+        return result.scalar_one_or_none()
+
+    async def list_by_user(self, user_id: int, limit: int = 10) -> list[Payment]:
+        result = await self.session.execute(
+            select(Payment)
+            .where(Payment.user_id == user_id)
+            .order_by(Payment.created_at.desc(), Payment.id.desc())
+            .limit(limit)
+        )
+        return list(result.scalars().all())
 
 
 class CompatibilityRepo:

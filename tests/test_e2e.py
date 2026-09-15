@@ -18,11 +18,18 @@ from aiogram.client.session.base import BaseSession  # noqa: E402
 from aiogram.enums import ParseMode  # noqa: E402
 from aiogram.fsm.storage.memory import MemoryStorage  # noqa: E402
 from aiogram.types import CallbackQuery, Chat, Message, Update, User  # noqa: E402
+from sqlalchemy import select  # noqa: E402
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # noqa: E402
 
 from src.db.base import Base  # noqa: E402
 from src.db.middleware import DbSessionMiddleware  # noqa: E402
-from src.db.repositories import PersonRepo, SearchHistoryRepo  # noqa: E402
+from src.db.models import PaymentIntent  # noqa: E402
+from src.db.repositories import (  # noqa: E402
+    PersonRepo,
+    SearchHistoryRepo,
+    SubscriptionRepo,
+    UserRepo,
+)
 from src.handlers import cabinet, calculation, combinations, common, report, subscription  # noqa: E402
 
 USER_ID = 555
@@ -236,3 +243,51 @@ class TestCabinetFSM(E2EBase):
             people = await PersonRepo(s).list(u.id)
         self.assertEqual(len(people), 1)
         self.assertEqual(people[0].birth_date.strftime("%d.%m.%Y"), "01.01.2000")
+
+
+class TestSubscriptionFlow(E2EBase):
+    """/subscribe больше не выдаёт премиум бесплатно — доступ только после оплаты."""
+
+    async def _is_premium(self) -> bool:
+        async with self.factory() as session:
+            user = await UserRepo(session).get_or_create(telegram_id=USER_ID)
+            return await SubscriptionRepo(session).is_active(user.id)
+
+    async def test_subscribe_does_not_grant_premium(self):
+        with patch("src.handlers.subscription.PAYMENTS_ENABLED", False):
+            await self.feed_text("/subscribe")
+        self.assertFalse(await self._is_premium())
+        self.assertIn("недоступна", self.session.last_text())
+
+    async def test_subscribe_sends_payment_button_and_creates_intent(self):
+        link = "https://biohimrefresh.payform.ru/?order_id=x&signature=y"
+        with patch("src.handlers.subscription.PAYMENTS_ENABLED", True), \
+             patch("src.handlers.subscription.build_payment_link", return_value=link):
+            await self.feed_text("/subscribe")
+
+        message = self.session.requests[-1]
+        button = message.reply_markup.inline_keyboard[0][0]
+        self.assertEqual(button.url, link)
+        self.assertFalse(await self._is_premium())
+
+        async with self.factory() as session:
+            user = await UserRepo(session).get_or_create(telegram_id=USER_ID)
+            result = await session.execute(
+                select(PaymentIntent).where(PaymentIntent.user_id == user.id)
+            )
+            intents = list(result.scalars().all())
+        self.assertEqual(len(intents), 1)
+
+    async def test_subscribe_shows_status_when_active(self):
+        async with self.factory() as session:
+            user = await UserRepo(session).get_or_create(telegram_id=USER_ID)
+            await SubscriptionRepo(session).set_premium(user.id, is_premium=True, days=30)
+            await session.commit()
+
+        with patch("src.handlers.subscription.PAYMENTS_ENABLED", True):
+            await self.feed_text("/subscribe")
+        self.assertIn("Подписка активна", self.session.last_text())
+
+    async def test_unsubscribe_without_recurring(self):
+        await self.feed_text("/unsubscribe")
+        self.assertIn("нет активной подписки", self.session.last_text())

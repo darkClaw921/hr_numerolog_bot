@@ -73,6 +73,7 @@ def cabinet_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="👥 Мои люди", callback_data="cab:people")],
         [InlineKeyboardButton(text="🕘 История поисков", callback_data="cab:history")],
         [InlineKeyboardButton(text="➕ Добавить человека", callback_data="cab:add")],
+        [InlineKeyboardButton(text="💎 Подписка", callback_data="cab:sub")],
     ])
 
 

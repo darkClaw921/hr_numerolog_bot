@@ -136,6 +136,18 @@ class Subscription(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
+    # --- Платёжный провайдер (Prodamus). Все поля nullable: у ручных выдач (/grant) их нет.
+    provider: Mapped[str | None] = mapped_column(String(32))
+    prodamus_subscription_id: Mapped[str | None] = mapped_column(String(64))
+    prodamus_customer_phone: Mapped[str | None] = mapped_column(String(32))
+    prodamus_customer_email: Mapped[str | None] = mapped_column(String(255))
+    # Активна ли рекуррентка на стороне Prodamus. False + is_premium=True — оплаченный
+    # период доживает, но продлений больше не будет.
+    prodamus_active: Mapped[bool | None] = mapped_column(Boolean)
+    next_payment_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_payment_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     user: Mapped["BotUser"] = relationship(back_populates="subscription")
 
 
@@ -165,4 +177,62 @@ class CompatibilityResult(Base):
     __table_args__ = (
         CheckConstraint("person_a_id <> person_b_id", name="distinct_people"),
         Index("ix_compat_pair", "person_a_id", "person_b_id"),
+    )
+
+
+class PaymentIntent(Base):
+    """
+    Намерение оплаты: связь выданного ботом order_id с пользователем.
+
+    Уведомление Prodamus принимается только для order_id, который бот сам выдал —
+    это защита от подделки идентификатора заказа.
+    """
+
+    __tablename__ = "payment_intents"
+
+    id: Mapped[int] = mapped_column(PkType, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("bot_users.id", ondelete="CASCADE"), nullable=False
+    )
+    order_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    amount_rub: Mapped[float | None] = mapped_column(Numeric(10, 2))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Payment(Base):
+    """
+    Журнал платёжных событий Prodamus (не состояние подписки — состояние в `subscriptions`).
+
+    `event_key` уникален и служит ключом идемпотентности: Prodamus повторяет доставку
+    уведомления при таймауте, и повтор не должен продлевать подписку дважды.
+    """
+
+    __tablename__ = "payments"
+
+    id: Mapped[int] = mapped_column(PkType, primary_key=True, autoincrement=True)
+    # NULL, если пользователя не удалось сопоставить — событие всё равно сохраняем для разбора.
+    user_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("bot_users.id", ondelete="SET NULL")
+    )
+    provider: Mapped[str] = mapped_column(String(32), nullable=False, default="prodamus")
+    event_key: Mapped[str] = mapped_column(String(191), nullable=False)
+    order_id: Mapped[str | None] = mapped_column(String(64))
+    order_num: Mapped[str | None] = mapped_column(String(64))
+    amount_rub: Mapped[float | None] = mapped_column(Numeric(10, 2))
+    currency: Mapped[str] = mapped_column(String(8), nullable=False, default="rub")
+    status: Mapped[str | None] = mapped_column(String(32))
+    payment_type: Mapped[str | None] = mapped_column(String(64))
+    # initial — первый платёж, renewal — автосписание, unknown — не удалось определить.
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="unknown")
+    subscription_payment_num: Mapped[int | None] = mapped_column(Integer)
+    customer_phone: Mapped[str | None] = mapped_column(String(32))
+    customer_email: Mapped[str | None] = mapped_column(String(255))
+    raw_payload: Mapped[dict | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("event_key", name="uq_payments_event_key"),
+        Index("ix_payments_user_created", "user_id", "created_at"),
+        Index("ix_payments_order_id", "order_id"),
     )

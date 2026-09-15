@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from src.config import DATABASE_URL
 from src.db.base import Base
+from src.db.migrations import ensure_schema
 # Импорт моделей обязателен: регистрирует таблицы в Base.metadata до create_all.
 from src.db import models  # noqa: F401
 
@@ -42,5 +43,7 @@ async def init_models() -> None:
     """Создаёт таблицы по моделям, если их ещё нет (вызывается при старте бота)."""
     async with engine.connect() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # create_all не добавляет колонки в уже существующие таблицы — доводим схему вручную.
+        await ensure_schema(conn)
         await conn.commit()
     logger.info("Схема БД инициализирована (%s)", DATABASE_URL)

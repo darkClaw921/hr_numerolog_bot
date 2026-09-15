@@ -1,0 +1,294 @@
+"""
+Тесты обработки уведомлений Prodamus: подпись, идемпотентность, продление, отмена.
+
+Проверяют и чистую логику (`apply_notification`), и HTTP-слой вебхука.
+"""
+import os
+import tempfile
+import unittest
+from datetime import datetime, timedelta
+
+os.environ.setdefault("BOT_TOKEN", "test")
+os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+os.environ.setdefault("PRODAMUS_SECRET_KEY", "webhook_test_secret")
+
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # noqa: E402
+
+from src.db.base import Base  # noqa: E402
+from src.db.models import Payment  # noqa: E402
+from src.db.repositories import PaymentIntentRepo, PaymentRepo, SubscriptionRepo, UserRepo  # noqa: E402
+from src.payments import service  # noqa: E402
+from src.payments.formdata import php_urlencode  # noqa: E402
+from src.payments.hmac_sign import create_signature  # noqa: E402
+
+SECRET = os.environ["PRODAMUS_SECRET_KEY"]
+TELEGRAM_ID = 555
+ORDER_ID = "1-abc123"
+
+
+def notification(
+    *,
+    order_id: str = ORDER_ID,
+    payment_status: str = "success",
+    payment_num: str = "1",
+    date_next_payment: str | None = "2026-10-07 12:00:00",
+    active_manager: str = "1",
+    date: str = "2026-09-07 12:00:00",
+    customer_extra: str = f"tg:{TELEGRAM_ID}",
+) -> dict:
+    """Уведомление в том виде, в каком его присылает Prodamus для подписки."""
+    subscription = {
+        "id": "7",
+        "name": "Премиум",
+        "active": "1",
+        "active_manager": active_manager,
+        "active_user": "1",
+        "cost": "299.00",
+        "payment_num": payment_num,
+    }
+    if date_next_payment is not None:
+        subscription["date_next_payment"] = date_next_payment
+    return {
+        "date": date,
+        "order_id": order_id,
+        "order_num": "100",
+        "sum": "299.00",
+        "customer_phone": "79998887766",
+        "customer_email": "user@example.ru",
+        "customer_extra": customer_extra,
+        "payment_type": "Оплата картой",
+        "payment_status": payment_status,
+        "products": [{"name": "Подписка", "price": "299.00", "quantity": "1"}],
+        "subscription": subscription,
+    }
+
+
+class WebhookTestBase(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self._tmp.close()
+        self.engine = create_async_engine(f"sqlite+aiosqlite:///{self._tmp.name}")
+        async with self.engine.connect() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            await conn.commit()
+        self.factory = async_sessionmaker(self.engine, expire_on_commit=False)
+
+        async with self.factory() as session:
+            user = await UserRepo(session).get_or_create(telegram_id=TELEGRAM_ID)
+            self.user_id = user.id
+            await PaymentIntentRepo(session).create(user.id, ORDER_ID, amount_rub=299)
+            await session.commit()
+
+    async def asyncTearDown(self):
+        await self.engine.dispose()
+        os.unlink(self._tmp.name)
+
+    async def apply(self, data: dict) -> service.ApplyResult:
+        async with self.factory() as session:
+            result = await service.apply_notification(session, data, php_urlencode(data))
+            await session.commit()
+            return result
+
+    async def subscription(self):
+        async with self.factory() as session:
+            return await SubscriptionRepo(session).get(self.user_id)
+
+    async def payments(self) -> list[Payment]:
+        async with self.factory() as session:
+            return await PaymentRepo(session).list_by_user(self.user_id, limit=50)
+
+
+class TestApplyNotification(WebhookTestBase):
+    async def test_first_payment_activates_premium(self):
+        result = await self.apply(notification())
+        self.assertEqual(result.outcome, service.OUTCOME_ACTIVATED)
+        self.assertEqual(result.telegram_id, TELEGRAM_ID)
+
+        sub = await self.subscription()
+        self.assertTrue(sub.is_premium)
+        self.assertTrue(sub.prodamus_active)
+        self.assertEqual(sub.provider, "prodamus")
+        self.assertEqual(sub.prodamus_subscription_id, "7")
+        # Срок = дата следующего списания + запас на повторные попытки.
+        self.assertEqual(sub.expires_at, datetime(2026, 10, 7, 12, 0) + timedelta(days=2))
+
+        events = await self.payments()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kind, "initial")
+        self.assertEqual(events[0].status, "success")
+
+    async def test_intent_marked_paid(self):
+        await self.apply(notification())
+        async with self.factory() as session:
+            intent = await PaymentIntentRepo(session).get_by_order_id(ORDER_ID)
+        self.assertIsNotNone(intent.paid_at)
+
+    async def test_duplicate_delivery_is_idempotent(self):
+        data = notification()
+        await self.apply(data)
+        first = await self.subscription()
+
+        result = await self.apply(data)
+        self.assertEqual(result.outcome, service.OUTCOME_DUPLICATE)
+
+        second = await self.subscription()
+        self.assertEqual(first.expires_at, second.expires_at)
+        self.assertEqual(len(await self.payments()), 1)
+
+    async def test_renewal_extends_subscription(self):
+        await self.apply(notification())
+        result = await self.apply(
+            notification(
+                payment_num="2",
+                date="2026-10-07 12:00:00",
+                date_next_payment="2026-11-07 12:00:00",
+            )
+        )
+        self.assertEqual(result.outcome, service.OUTCOME_RENEWED)
+
+        sub = await self.subscription()
+        self.assertEqual(sub.expires_at, datetime(2026, 11, 7, 12, 0) + timedelta(days=2))
+        events = await self.payments()
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0].kind, "renewal")
+
+    async def test_renewal_without_next_date_extends_from_current_end(self):
+        """Без date_next_payment продлеваем от конца периода, а не от «сейчас»."""
+        await self.apply(notification(date_next_payment=None))
+        first = await self.subscription()
+        await self.apply(
+            notification(payment_num="2", date="2026-10-01 10:00:00", date_next_payment=None)
+        )
+        second = await self.subscription()
+        self.assertEqual(second.expires_at, first.expires_at + timedelta(days=31))
+
+    async def test_failed_payment_keeps_expiry(self):
+        await self.apply(notification())
+        before = await self.subscription()
+
+        result = await self.apply(
+            notification(payment_status="failed", payment_num="2", date="2026-10-07 12:00:00")
+        )
+        self.assertEqual(result.outcome, service.OUTCOME_FAILED)
+
+        after = await self.subscription()
+        self.assertEqual(before.expires_at, after.expires_at)
+        self.assertTrue(after.is_premium)
+        self.assertEqual(len(await self.payments()), 2)
+
+    async def test_cancellation_keeps_access_until_period_end(self):
+        await self.apply(notification())
+        result = await self.apply(
+            notification(
+                payment_status="",
+                active_manager="0",
+                payment_num="1",
+                date="2026-09-08 12:00:00",
+            )
+        )
+        self.assertEqual(result.outcome, service.OUTCOME_CANCELLED)
+
+        sub = await self.subscription()
+        self.assertFalse(sub.prodamus_active)
+        self.assertIsNotNone(sub.cancelled_at)
+        # Доступ не снимаем: оплаченный период дорабатывает до конца.
+        self.assertTrue(sub.is_premium)
+        async with self.factory() as session:
+            self.assertTrue(await SubscriptionRepo(session).is_active(self.user_id))
+
+    async def test_unknown_order_id_is_recorded_without_activation(self):
+        result = await self.apply(notification(order_id="not-mine", customer_extra=""))
+        self.assertEqual(result.outcome, service.OUTCOME_UNMATCHED)
+        self.assertIsNone(await self.subscription())
+
+        async with self.factory() as session:
+            payment = await PaymentRepo(session).get_by_event_key(
+                service.build_event_key(notification(order_id="not-mine", customer_extra=""))
+            )
+        self.assertIsNotNone(payment)
+        self.assertIsNone(payment.user_id)
+
+    async def test_matching_by_customer_extra(self):
+        """Автосписание без нашего order_id находит пользователя по customer_extra."""
+        result = await self.apply(notification(order_id="foreign-1"))
+        self.assertEqual(result.outcome, service.OUTCOME_ACTIVATED)
+        self.assertEqual(result.telegram_id, TELEGRAM_ID)
+
+
+class TestWebhookHttp(WebhookTestBase):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        from aiohttp.test_utils import TestClient, TestServer
+
+        from src.payments import webhook
+
+        # Вебхук ходит в БД через общую фабрику сессий — подменяем её на тестовую.
+        self._orig_factory = webhook.async_session_factory
+        webhook.async_session_factory = self.factory
+        # src.config читает окружение один раз при импорте, а порядок импорта модулей
+        # в discover не гарантирован — задаём секрет прямо в модуле вебхука.
+        self._orig_secret = webhook.PRODAMUS_SECRET_KEY
+        webhook.PRODAMUS_SECRET_KEY = SECRET
+        self._webhook = webhook
+
+        self.client = TestClient(TestServer(webhook.create_webhook_app(bot=None)))
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self._webhook.async_session_factory = self._orig_factory
+        self._webhook.PRODAMUS_SECRET_KEY = self._orig_secret
+        await super().asyncTearDown()
+
+    async def post(self, data: dict, signature: str | None = None):
+        body = php_urlencode(data)
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Sign": signature if signature is not None else create_signature(data, SECRET),
+        }
+        return await self.client.post(self._webhook.PRODAMUS_WEBHOOK_PATH, data=body, headers=headers)
+
+    async def test_valid_signature_activates(self):
+        response = await self.post(notification())
+        self.assertEqual(response.status, 200)
+        sub = await self.subscription()
+        self.assertTrue(sub.is_premium)
+
+    async def test_invalid_signature_rejected(self):
+        response = await self.post(notification(), signature="0" * 64)
+        self.assertEqual(response.status, 400)
+        self.assertIsNone(await self.subscription())
+        self.assertEqual(await self.payments(), [])
+
+    async def test_missing_signature_rejected(self):
+        body = php_urlencode(notification())
+        response = await self.client.post(
+            self._webhook.PRODAMUS_WEBHOOK_PATH,
+            data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertEqual(response.status, 400)
+
+    async def test_repeated_delivery_returns_200_once_applied(self):
+        data = notification()
+        self.assertEqual((await self.post(data)).status, 200)
+        first = await self.subscription()
+        self.assertEqual((await self.post(data)).status, 200)
+        second = await self.subscription()
+        self.assertEqual(first.expires_at, second.expires_at)
+        self.assertEqual(len(await self.payments()), 1)
+
+    async def test_oversized_body_rejected(self):
+        data = notification()
+        data["customer_extra"] = "x" * (self._webhook.MAX_BODY_BYTES + 10)
+        response = await self.post(data)
+        self.assertIn(response.status, (400, 413))
+        self.assertIsNone(await self.subscription())
+
+    async def test_healthcheck(self):
+        response = await self.client.get("/healthz")
+        self.assertEqual(response.status, 200)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -10,6 +10,7 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # noqa: E402
 
 from src.db.base import Base  # noqa: E402
+from src.db.migrations import ensure_schema  # noqa: E402
 from src.db.repositories import (  # noqa: E402
     PersonRepo,
     SearchHistoryRepo,
@@ -90,3 +91,59 @@ class TestRepositories(unittest.IsolatedAsyncioTestCase):
             await repo.set_premium(u.id, days=None)  # бессрочно
             await s.commit()
             self.assertTrue(await repo.is_active(u.id))
+
+
+class TestSchemaMigration(unittest.IsolatedAsyncioTestCase):
+    """Мини-миграции: alembic нет, колонки в существующие таблицы добавляем сами."""
+
+    async def asyncSetUp(self):
+        self._tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self._tmp.close()
+        self.engine = create_async_engine(f"sqlite+aiosqlite:///{self._tmp.name}")
+
+    async def asyncTearDown(self):
+        await self.engine.dispose()
+        os.unlink(self._tmp.name)
+
+    async def _columns(self, conn, table: str) -> set[str]:
+        result = await conn.exec_driver_sql(f"PRAGMA table_info({table})")
+        return {row[1] for row in result.fetchall()}
+
+    async def test_adds_missing_columns_to_legacy_table(self):
+        legacy_ddl = (
+            "CREATE TABLE subscriptions ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, user_id BIGINT NOT NULL UNIQUE, "
+            "is_premium BOOLEAN NOT NULL, plan VARCHAR(32) NOT NULL, price_rub INTEGER NOT NULL, "
+            "started_at DATETIME, expires_at DATETIME, created_at DATETIME, updated_at DATETIME)"
+        )
+        async with self.engine.connect() as conn:
+            await conn.exec_driver_sql(legacy_ddl)
+            await conn.exec_driver_sql(
+                "INSERT INTO subscriptions (user_id, is_premium, plan, price_rub) VALUES (1, 1, 'premium_monthly', 299)"
+            )
+            await conn.commit()
+
+            await ensure_schema(conn)
+            await conn.commit()
+
+            columns = await self._columns(conn, "subscriptions")
+            self.assertIn("prodamus_subscription_id", columns)
+            self.assertIn("cancelled_at", columns)
+            # Существующие данные не пострадали.
+            result = await conn.exec_driver_sql("SELECT user_id, is_premium FROM subscriptions")
+            self.assertEqual(result.fetchall(), [(1, 1)])
+
+    async def test_idempotent(self):
+        async with self.engine.connect() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            await conn.commit()
+            await ensure_schema(conn)
+            await ensure_schema(conn)
+            await conn.commit()
+            self.assertIn("provider", await self._columns(conn, "subscriptions"))
+
+    async def test_skips_absent_table(self):
+        """Пустая БД: таблиц ещё нет — миграция не должна падать."""
+        async with self.engine.connect() as conn:
+            await ensure_schema(conn)
+            await conn.commit()

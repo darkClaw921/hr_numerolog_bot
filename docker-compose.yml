@@ -3,6 +3,10 @@ services:
     build: .
     container_name: hr-numerolog-bot
     env_file: .env
+    # Вебхук Prodamus слушает внутри контейнера; наружу его проксирует
+    # reverse proxy на хосте (HTTPS), поэтому публикуем только на localhost.
+    ports:
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./data:/data
     restart: unless-stopped

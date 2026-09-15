@@ -8,11 +8,19 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiohttp import web
 
-from src.config import BOT_TOKEN
+from src.config import (
+    BOT_TOKEN,
+    PAYMENTS_ENABLED,
+    PRODAMUS_WEBHOOK_HOST,
+    PRODAMUS_WEBHOOK_PATH,
+    PRODAMUS_WEBHOOK_PORT,
+)
 from src.db.middleware import DbSessionMiddleware
 from src.db.session import init_models
 from src.handlers import cabinet, calculation, combinations, common, report, subscription
+from src.payments.webhook import create_webhook_app
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,5 +55,24 @@ async def main():
     dp.include_router(combinations.router)
     dp.include_router(report.router)
 
+    # Приёмник уведомлений Prodamus живёт в этом же процессе рядом с polling.
+    # AppRunner, а не web.run_app: последний заводит свой event loop и обработчики
+    # сигналов, что конфликтует с asyncio.run в main.py.
+    runner = None
+    if PAYMENTS_ENABLED:
+        runner = web.AppRunner(create_webhook_app(bot), access_log=None)
+        await runner.setup()
+        await web.TCPSite(runner, PRODAMUS_WEBHOOK_HOST, PRODAMUS_WEBHOOK_PORT).start()
+        logger.info(
+            "Вебхук Prodamus слушает %s:%s%s",
+            PRODAMUS_WEBHOOK_HOST,
+            PRODAMUS_WEBHOOK_PORT,
+            PRODAMUS_WEBHOOK_PATH,
+        )
+
     logger.info("Бот запущен")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if runner is not None:
+            await runner.cleanup()

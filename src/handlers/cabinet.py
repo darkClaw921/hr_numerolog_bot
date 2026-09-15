@@ -11,9 +11,15 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
 from src.db.models import BotUser
-from src.db.repositories import PersonRepo, SearchHistoryRepo, SubscriptionRepo
+from src.db.repositories import (
+    PaymentIntentRepo,
+    PersonRepo,
+    SearchHistoryRepo,
+    SubscriptionRepo,
+)
 from src.formatting import person_label
 from src.handlers.calculation import render_result
+from src.handlers.subscription import render_subscription_screen
 from src.keyboards import cabinet_menu_keyboard, people_list_keyboard, skip_keyboard
 from src.utils.numerology import CALC_VERSION, calculate_all, format_date_for_calc, parse_date
 
@@ -77,6 +83,18 @@ async def cb_history(callback: CallbackQuery, history_repo: SearchHistoryRepo, d
         date_str = item.birth_date.strftime("%d.%m.%Y")
         lines.append(f"• {date_str} <i>({when})</i>")
     await callback.message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@router.callback_query(F.data == "cab:sub")
+async def cb_subscription(
+    callback: CallbackQuery,
+    subscription_repo: SubscriptionRepo,
+    intent_repo: PaymentIntentRepo,
+    db_user: BotUser,
+):
+    """Экран подписки из кабинета — тот же, что у /subscribe."""
+    await callback.answer()
+    await render_subscription_screen(callback.message, db_user, subscription_repo, intent_repo)
 
 
 # ---------- Открытие сохранённого человека ----------
