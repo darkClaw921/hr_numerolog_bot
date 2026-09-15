@@ -248,11 +248,37 @@ class TestWebhookHttp(WebhookTestBase):
         }
         return await self.client.post(self._webhook.PRODAMUS_WEBHOOK_PATH, data=body, headers=headers)
 
+    async def post_multipart(self, data: dict, signature: str | None = None):
+        """Так уведомление отправляет сам Prodamus — multipart/form-data с плоскими ключами."""
+        import aiohttp
+
+        from src.payments.formdata import php_form_pairs
+
+        writer = aiohttp.MultipartWriter("form-data")
+        for key, value in php_form_pairs(data):
+            part = writer.append(value)
+            part.set_content_disposition("form-data", name=key)
+        headers = {"Sign": signature if signature is not None else create_signature(data, SECRET)}
+        return await self.client.post(self._webhook.PRODAMUS_WEBHOOK_PATH, data=writer, headers=headers)
+
     async def test_valid_signature_activates(self):
         response = await self.post(notification())
         self.assertEqual(response.status, 200)
         sub = await self.subscription()
         self.assertTrue(sub.is_premium)
+
+    async def test_multipart_notification_activates(self):
+        """Регрессия: Prodamus шлёт multipart/form-data — подпись должна сойтись и в этом формате."""
+        response = await self.post_multipart(notification())
+        self.assertEqual(response.status, 200)
+        sub = await self.subscription()
+        self.assertTrue(sub.is_premium)
+        self.assertEqual(len(await self.payments()), 1)
+
+    async def test_multipart_invalid_signature_rejected(self):
+        response = await self.post_multipart(notification(), signature="0" * 64)
+        self.assertEqual(response.status, 400)
+        self.assertIsNone(await self.subscription())
 
     async def test_invalid_signature_rejected(self):
         response = await self.post(notification(), signature="0" * 64)

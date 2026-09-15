@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import aiohttp  # noqa: E402
 
 from src.config import PRODAMUS_SECRET_KEY, PRODAMUS_WEBHOOK_PATH, PRODAMUS_WEBHOOK_PORT  # noqa: E402
-from src.payments.formdata import php_urlencode  # noqa: E402
+from src.payments.formdata import php_form_pairs  # noqa: E402
 from src.payments.hmac_sign import create_signature  # noqa: E402
 
 
@@ -76,12 +76,12 @@ async def main() -> int:
         signature = "0" * 64
 
     print(json.dumps(payload, ensure_ascii=False, indent=2))
+    # Как сам Prodamus: multipart/form-data с плоскими ключами products[0][name] и т.п.
+    writer = aiohttp.MultipartWriter("form-data")
+    for key, value in php_form_pairs(payload):
+        writer.append(value).set_content_disposition("form-data", name=key)
     async with aiohttp.ClientSession() as session:
-        async with session.post(
-            args.url,
-            data=php_urlencode(payload),
-            headers={"Content-Type": "application/x-www-form-urlencoded", "Sign": signature},
-        ) as response:
+        async with session.post(args.url, data=writer, headers={"Sign": signature}) as response:
             print(f"\nHTTP {response.status}: {await response.text()}")
             return 0 if response.status == 200 else 1
 

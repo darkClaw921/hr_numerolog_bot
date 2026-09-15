@@ -1,5 +1,9 @@
 """
-HTTP-приёмник уведомлений Prodamus (urlNotification).
+HTTP-приёмник уведомлений Prodamus.
+
+Prodamus шлёт уведомления POST-запросом в multipart/form-data на адреса из настроек ЛК
+(«Настройки» → «URL адреса для уведомлений», для клубов — ещё и в разделе «Подписки»);
+параметр urlNotification в ссылке он не использует.
 
 Живёт в том же процессе, что и long polling: aiohttp-приложение поднимается через
 AppRunner в `src.bot.main()`. Наружу путь вебхука проксирует reverse proxy по HTTPS.
@@ -7,6 +11,7 @@ AppRunner в `src.bot.main()`. Наружу путь вебхука прокси
 import logging
 import time
 from collections import defaultdict, deque
+from urllib.parse import urlencode
 
 from aiogram import Bot
 from aiohttp import web
@@ -17,7 +22,7 @@ from src.config import (
 )
 from src.db.session import async_session_factory
 from src.payments import service
-from src.payments.formdata import parse_php_form
+from src.payments.formdata import parse_php_pairs
 from src.payments.hmac_sign import verify_signature
 from src.texts import (
     SUB_NOTIFY_ACTIVATED,
@@ -55,6 +60,15 @@ def _format_date(value) -> str:
     return value.strftime("%d.%m.%Y") if value is not None else "—"
 
 
+async def _read_form_pairs(request: web.Request) -> list[tuple[str, str]]:
+    """
+    Поля формы как пары (ключ, значение) — и для multipart/form-data, и для urlencoded.
+    Файловые части (в уведомлениях их не бывает) пропускаются.
+    """
+    form = await request.post()
+    return [(key, value) for key, value in form.items() if isinstance(value, str)]
+
+
 async def _notify_user(bot: Bot, result: service.ApplyResult) -> None:
     """Сообщение пользователю после коммита; сбой Telegram не должен влиять на ответ."""
     if bot is None or result.telegram_id is None:
@@ -77,7 +91,7 @@ async def _notify_user(bot: Bot, result: service.ApplyResult) -> None:
 
 
 async def handle_notification(request: web.Request) -> web.Response:
-    """POST urlNotification: проверяет подпись и применяет событие к подписке."""
+    """POST-уведомление Prodamus: проверяет подпись и применяет событие к подписке."""
     ip = request.headers.get("X-Forwarded-For", request.remote or "").split(",")[0].strip()
     if _rate_limited(ip):
         logger.warning("Prodamus: превышен лимит запросов с %s", ip)
@@ -87,19 +101,23 @@ async def handle_notification(request: web.Request) -> web.Response:
         return web.Response(status=413, text="payload too large")
 
     try:
-        raw = await request.text()
+        pairs = await _read_form_pairs(request)
+    except web.HTTPRequestEntityTooLarge:
+        return web.Response(status=413, text="payload too large")
     except ValueError:
-        return web.Response(status=413, text="payload too large")
-    if len(raw.encode("utf-8")) > MAX_BODY_BYTES:
-        return web.Response(status=413, text="payload too large")
+        logger.warning("Prodamus: не удалось разобрать тело (content-type=%s)", request.content_type)
+        return web.Response(status=400, text="bad form")
 
-    data = parse_php_form(raw)
+    data = parse_php_pairs(pairs)
+    # Канонический вид тела — для ключа идемпотентности, если в данных мало полей.
+    raw = urlencode(pairs)
     signature = request.headers.get("Sign") or request.headers.get("sign")
     if not verify_signature(data, PRODAMUS_SECRET_KEY, signature):
         # В лог — ничего секретного: только ключи payload и обрезанная подпись.
         logger.warning(
-            "Prodamus: неверная подпись (order_id=%s, keys=%s, sign=%s…)",
+            "Prodamus: неверная подпись (order_id=%s, content-type=%s, keys=%s, sign=%s…)",
             data.get("order_id"),
+            request.content_type,
             sorted(data),
             (signature or "")[:8],
         )

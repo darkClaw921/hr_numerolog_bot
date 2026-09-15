@@ -1,14 +1,16 @@
 """
-Разбор тела уведомления Prodamus (application/x-www-form-urlencoded) в структуру,
-эквивалентную PHP-массиву `$_POST`.
+Разбор полей уведомления Prodamus в структуру, эквивалентную PHP-массиву `$_POST`.
 
-Prodamus подписывает исходный ассоциативный массив, а form-urlencoded — лишь транспорт,
-поэтому подпись проверяется ПОСЛЕ разбора, на восстановленной структуре.
+Prodamus шлёт уведомление в multipart/form-data с плоскими ключами вида
+`products[0][name]`, `subscription[id]`. Он подписывает исходный ассоциативный массив,
+а форма — лишь транспорт, поэтому подпись проверяется ПОСЛЕ разбора, на восстановленной
+структуре. Транспорт (multipart или urlencoded) на результат не влияет.
 
 Ключевая тонкость: PHP-массив с ключами 0..n-1 без пропусков json_encode кодирует как
 список, а не объект. Если этого не воспроизвести, подпись не сойдётся.
 """
 import re
+from collections.abc import Iterable
 from urllib.parse import parse_qsl
 
 _KEY_RE = re.compile(r"^([^\[\]]+)((?:\[[^\[\]]*\])*)$")
@@ -54,13 +56,31 @@ def _listify(node):
     return converted
 
 
-def parse_php_form(body: str) -> dict:
-    """'products[0][name]=X&order_id=1' -> {'products': [{'name': 'X'}], 'order_id': '1'}"""
+def parse_php_pairs(pairs: Iterable[tuple[str, str]]) -> dict:
+    """[('products[0][name]', 'X'), ('order_id', '1')] -> {'products': [{'name': 'X'}], 'order_id': '1'}"""
     root: dict = {}
-    for key, value in parse_qsl(body, keep_blank_values=True):
+    for key, value in pairs:
         _assign(root, _split_key(key), value)
     result = _listify(root)
     return result if isinstance(result, dict) else root
+
+
+def parse_php_form(body: str) -> dict:
+    """'products[0][name]=X&order_id=1' -> {'products': [{'name': 'X'}], 'order_id': '1'}"""
+    return parse_php_pairs(parse_qsl(body, keep_blank_values=True))
+
+
+def php_form_pairs(data, prefix: str = "") -> list[tuple[str, str]]:
+    """Вложенная структура -> плоские пары PHP-формы (для multipart в тестах и имитации)."""
+    pairs: list[tuple[str, str]] = []
+    items = enumerate(data) if isinstance(data, (list, tuple)) else data.items()
+    for key, value in items:
+        full = f"{prefix}[{key}]" if prefix else str(key)
+        if isinstance(value, (dict, list, tuple)):
+            pairs.extend(php_form_pairs(value, full))
+        else:
+            pairs.append((full, "" if value is None else str(value)))
+    return pairs
 
 
 def php_urlencode(data, prefix: str = "") -> str:
