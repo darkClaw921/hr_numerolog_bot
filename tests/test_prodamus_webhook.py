@@ -2,6 +2,8 @@
 Тесты обработки уведомлений Prodamus: подпись, идемпотентность, продление, отмена.
 
 Проверяют и чистую логику (`apply_notification`), и HTTP-слой вебхука.
+Формат уведомления сверен с реальным: номер заказа Prodamus приходит в `order_id`,
+выданный ботом идентификатор — в `order_num`, даты без зоны — московское время.
 """
 import os
 import tempfile
@@ -23,27 +25,33 @@ from src.payments.hmac_sign import create_signature  # noqa: E402
 
 SECRET = os.environ["PRODAMUS_SECRET_KEY"]
 TELEGRAM_ID = 555
+# Идентификатор, который выдал бот (приходит обратно в order_num).
 ORDER_ID = "1-abc123"
+# Номер заказа на стороне Prodamus (приходит в order_id).
+PRODAMUS_ORDER_ID = "48808966"
+# Даты Prodamus без зоны — московское время (UTC+3).
+MSK_OFFSET = timedelta(hours=3)
 
 
 def notification(
     *,
-    order_id: str = ORDER_ID,
+    order_num: str = ORDER_ID,
+    order_id: str = PRODAMUS_ORDER_ID,
     payment_status: str = "success",
     payment_num: str = "1",
     date_next_payment: str | None = "2026-10-07 12:00:00",
     active_manager: str = "1",
-    date: str = "2026-09-07 12:00:00",
+    date: str = "2026-09-07T12:00:00+03:00",
     customer_extra: str = f"tg:{TELEGRAM_ID}",
 ) -> dict:
     """Уведомление в том виде, в каком его присылает Prodamus для подписки."""
     subscription = {
         "id": "7",
         "name": "Премиум",
-        "active": "1",
         "active_manager": active_manager,
         "active_user": "1",
         "cost": "299.00",
+        "first_payment_discount": "100.00",
         "payment_num": payment_num,
     }
     if date_next_payment is not None:
@@ -51,16 +59,37 @@ def notification(
     return {
         "date": date,
         "order_id": order_id,
-        "order_num": "100",
-        "sum": "299.00",
+        "order_num": order_num,
+        "sum": "199.00",
         "customer_phone": "79998887766",
         "customer_email": "user@example.ru",
         "customer_extra": customer_extra,
         "payment_type": "Оплата картой",
         "payment_status": payment_status,
-        "products": [{"name": "Подписка", "price": "299.00", "quantity": "1"}],
+        "products": [{"name": "Подписка", "price": "199.00", "quantity": "1", "sum": "199.00"}],
         "subscription": subscription,
     }
+
+
+class TestParseProdamusDatetime(unittest.TestCase):
+    def test_naive_date_is_moscow_time(self):
+        self.assertEqual(
+            service.parse_prodamus_datetime("2026-10-15 19:35:23"),
+            datetime(2026, 10, 15, 16, 35, 23),
+        )
+
+    def test_iso_with_zone_converted_by_its_zone(self):
+        self.assertEqual(
+            service.parse_prodamus_datetime("2026-09-15T19:36:26+03:00"),
+            datetime(2026, 9, 15, 16, 36, 26),
+        )
+
+    def test_date_only(self):
+        self.assertEqual(service.parse_prodamus_datetime("2026-10-15"), datetime(2026, 10, 14, 21, 0))
+
+    def test_empty_and_garbage(self):
+        self.assertIsNone(service.parse_prodamus_datetime(""))
+        self.assertIsNone(service.parse_prodamus_datetime("не дата"))
 
 
 class WebhookTestBase(unittest.IsolatedAsyncioTestCase):
@@ -76,7 +105,7 @@ class WebhookTestBase(unittest.IsolatedAsyncioTestCase):
         async with self.factory() as session:
             user = await UserRepo(session).get_or_create(telegram_id=TELEGRAM_ID)
             self.user_id = user.id
-            await PaymentIntentRepo(session).create(user.id, ORDER_ID, amount_rub=299)
+            await PaymentIntentRepo(session).create(user.id, ORDER_ID, amount_rub=199)
             await session.commit()
 
     async def asyncTearDown(self):
@@ -103,25 +132,34 @@ class TestApplyNotification(WebhookTestBase):
         result = await self.apply(notification())
         self.assertEqual(result.outcome, service.OUTCOME_ACTIVATED)
         self.assertEqual(result.telegram_id, TELEGRAM_ID)
+        self.assertEqual(result.order_id, ORDER_ID)
 
         sub = await self.subscription()
         self.assertTrue(sub.is_premium)
         self.assertTrue(sub.prodamus_active)
         self.assertEqual(sub.provider, "prodamus")
         self.assertEqual(sub.prodamus_subscription_id, "7")
-        # Срок = дата следующего списания + запас на повторные попытки.
-        self.assertEqual(sub.expires_at, datetime(2026, 10, 7, 12, 0) + timedelta(days=2))
+        # Срок = дата следующего списания (МСК → UTC) + запас на повторные попытки.
+        self.assertEqual(sub.expires_at, datetime(2026, 10, 7, 12, 0) - MSK_OFFSET + timedelta(days=2))
 
         events = await self.payments()
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].kind, "initial")
         self.assertEqual(events[0].status, "success")
+        self.assertEqual(events[0].order_id, PRODAMUS_ORDER_ID)
+        self.assertEqual(events[0].order_num, ORDER_ID)
 
     async def test_intent_marked_paid(self):
         await self.apply(notification())
         async with self.factory() as session:
             intent = await PaymentIntentRepo(session).get_by_order_id(ORDER_ID)
         self.assertIsNotNone(intent.paid_at)
+
+    async def test_matched_by_order_num_without_customer_extra(self):
+        """Регрессия: наш идентификатор Prodamus возвращает в order_num, а не в order_id."""
+        result = await self.apply(notification(customer_extra=""))
+        self.assertEqual(result.outcome, service.OUTCOME_ACTIVATED)
+        self.assertEqual(result.telegram_id, TELEGRAM_ID)
 
     async def test_duplicate_delivery_is_idempotent(self):
         data = notification()
@@ -139,15 +177,16 @@ class TestApplyNotification(WebhookTestBase):
         await self.apply(notification())
         result = await self.apply(
             notification(
+                order_id="48900000",
                 payment_num="2",
-                date="2026-10-07 12:00:00",
+                date="2026-10-07T12:00:00+03:00",
                 date_next_payment="2026-11-07 12:00:00",
             )
         )
         self.assertEqual(result.outcome, service.OUTCOME_RENEWED)
 
         sub = await self.subscription()
-        self.assertEqual(sub.expires_at, datetime(2026, 11, 7, 12, 0) + timedelta(days=2))
+        self.assertEqual(sub.expires_at, datetime(2026, 11, 7, 12, 0) - MSK_OFFSET + timedelta(days=2))
         events = await self.payments()
         self.assertEqual(len(events), 2)
         self.assertEqual(events[0].kind, "renewal")
@@ -157,7 +196,7 @@ class TestApplyNotification(WebhookTestBase):
         await self.apply(notification(date_next_payment=None))
         first = await self.subscription()
         await self.apply(
-            notification(payment_num="2", date="2026-10-01 10:00:00", date_next_payment=None)
+            notification(payment_num="2", date="2026-10-01T10:00:00+03:00", date_next_payment=None)
         )
         second = await self.subscription()
         self.assertEqual(second.expires_at, first.expires_at + timedelta(days=31))
@@ -167,7 +206,7 @@ class TestApplyNotification(WebhookTestBase):
         before = await self.subscription()
 
         result = await self.apply(
-            notification(payment_status="failed", payment_num="2", date="2026-10-07 12:00:00")
+            notification(payment_status="failed", payment_num="2", date="2026-10-07T12:00:00+03:00")
         )
         self.assertEqual(result.outcome, service.OUTCOME_FAILED)
 
@@ -183,7 +222,7 @@ class TestApplyNotification(WebhookTestBase):
                 payment_status="",
                 active_manager="0",
                 payment_num="1",
-                date="2026-09-08 12:00:00",
+                date="2026-09-08T12:00:00+03:00",
             )
         )
         self.assertEqual(result.outcome, service.OUTCOME_CANCELLED)
@@ -196,21 +235,20 @@ class TestApplyNotification(WebhookTestBase):
         async with self.factory() as session:
             self.assertTrue(await SubscriptionRepo(session).is_active(self.user_id))
 
-    async def test_unknown_order_id_is_recorded_without_activation(self):
-        result = await self.apply(notification(order_id="not-mine", customer_extra=""))
+    async def test_unknown_order_is_recorded_without_activation(self):
+        foreign = notification(order_num="not-mine", order_id="1", customer_extra="")
+        result = await self.apply(foreign)
         self.assertEqual(result.outcome, service.OUTCOME_UNMATCHED)
         self.assertIsNone(await self.subscription())
 
         async with self.factory() as session:
-            payment = await PaymentRepo(session).get_by_event_key(
-                service.build_event_key(notification(order_id="not-mine", customer_extra=""))
-            )
+            payment = await PaymentRepo(session).get_by_event_key(service.build_event_key(foreign))
         self.assertIsNotNone(payment)
         self.assertIsNone(payment.user_id)
 
     async def test_matching_by_customer_extra(self):
-        """Автосписание без нашего order_id находит пользователя по customer_extra."""
-        result = await self.apply(notification(order_id="foreign-1"))
+        """Автосписание без нашего идентификатора находит пользователя по customer_extra."""
+        result = await self.apply(notification(order_num="foreign-1"))
         self.assertEqual(result.outcome, service.OUTCOME_ACTIVATED)
         self.assertEqual(result.telegram_id, TELEGRAM_ID)
 
@@ -249,7 +287,7 @@ class TestWebhookHttp(WebhookTestBase):
         return await self.client.post(self._webhook.PRODAMUS_WEBHOOK_PATH, data=body, headers=headers)
 
     async def post_multipart(self, data: dict, signature: str | None = None):
-        """Так уведомление отправляет сам Prodamus — multipart/form-data с плоскими ключами."""
+        """Уведомление в multipart/form-data с плоскими ключами — Prodamus поддерживает и этот формат."""
         import aiohttp
 
         from src.payments.formdata import php_form_pairs
@@ -268,7 +306,7 @@ class TestWebhookHttp(WebhookTestBase):
         self.assertTrue(sub.is_premium)
 
     async def test_multipart_notification_activates(self):
-        """Регрессия: Prodamus шлёт multipart/form-data — подпись должна сойтись и в этом формате."""
+        """Подпись должна сходиться и в multipart/form-data."""
         response = await self.post_multipart(notification())
         self.assertEqual(response.status, 200)
         sub = await self.subscription()

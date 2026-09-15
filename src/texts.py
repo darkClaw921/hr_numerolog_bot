@@ -2,7 +2,7 @@
 Тексты и константы интерфейса бота (названия секторов/качеств, тексты подписки).
 Вынесено отдельно, чтобы делиться между несколькими роутерами без дублирования.
 """
-from src.config import SUBSCRIPTION_PRICE_RUB
+from src.config import SUBSCRIPTION_FIRST_PAYMENT_RUB, SUBSCRIPTION_PRICE_RUB
 
 # Названия секторов матрицы 1-9. Сектор 6 переименован по ТЗ: ТРУД → ДЕНЬГИ/ТРУД.
 SECTOR_NAMES = {
@@ -44,10 +44,19 @@ QUALITY_NAMES = {
 # Порядок кнопок качеств в клавиатуре.
 QUALITY_ORDER = ["life", "temperament", "family", "stability", "purpose", "transformation", "destiny_number"]
 
+# Скидка на первый платёж задаётся в подписке Prodamus (first_payment_discount) — тексты
+# должны честно показывать и цену первого месяца, и цену продления.
+HAS_FIRST_PAYMENT_DISCOUNT = SUBSCRIPTION_FIRST_PAYMENT_RUB < SUBSCRIPTION_PRICE_RUB
+SUB_PRICE_LABEL = (
+    f"первый месяц {SUBSCRIPTION_FIRST_PAYMENT_RUB} ₽, далее {SUBSCRIPTION_PRICE_RUB} ₽/мес"
+    if HAS_FIRST_PAYMENT_DISCOUNT
+    else f"{SUBSCRIPTION_PRICE_RUB} ₽/мес"
+)
+
 # Текст-заглушка для платных функций (показывается не-premium пользователям).
 PAYWALL_TEXT = (
     "🔒 <b>Это платная функция.</b>\n\n"
-    f"Полный доступ открывается по подписке — <b>{SUBSCRIPTION_PRICE_RUB} ₽/мес</b>:\n"
+    f"Полный доступ открывается по подписке — <b>{SUB_PRICE_LABEL}</b>:\n"
     "• 📄 Полный общий отчёт (текст + файл .md)\n"
     "• 🧩 Комбинации секторов\n"
     "• Коэффициенты: Быт, Темперамент, Семья, Стабильность, Трансформация\n\n"
@@ -69,15 +78,25 @@ SUB_FEATURES = (
 
 SUB_OFFER_TEXT = (
     f"💎 <b>Подписка — {SUBSCRIPTION_PRICE_RUB} ₽/мес</b>\n\n"
-    "Открывает доступ к платным функциям:\n"
-    f"{SUB_FEATURES}\n\n"
-    "Оплата картой через Prodamus, продление автоматическое. "
-    "Отменить можно в любой момент командой /unsubscribe."
+    + (
+        f"🔥 Первый месяц — <b>{SUBSCRIPTION_FIRST_PAYMENT_RUB} ₽</b>, "
+        f"дальше {SUBSCRIPTION_PRICE_RUB} ₽/мес.\n\n"
+        if HAS_FIRST_PAYMENT_DISCOUNT
+        else ""
+    )
+    + "Открывает доступ к платным функциям:\n"
+    + f"{SUB_FEATURES}\n\n"
+    + "Оплата картой через Prodamus, продление автоматическое. "
+    + "Отменить можно в любой момент командой /unsubscribe."
 )
 
 SUB_OFFER_TRIAL_LINE = "\n\n🎁 Первые {days} дн. бесплатно — списание начнётся после пробного периода."
 
-SUB_PAY_BUTTON = f"💳 Оформить за {SUBSCRIPTION_PRICE_RUB} ₽/мес"
+SUB_PAY_BUTTON = (
+    f"💳 Оформить за {SUBSCRIPTION_FIRST_PAYMENT_RUB} ₽"
+    if HAS_FIRST_PAYMENT_DISCOUNT
+    else f"💳 Оформить за {SUBSCRIPTION_PRICE_RUB} ₽/мес"
+)
 
 SUB_DISABLED_TEXT = (
     "💎 <b>Подписка</b>\n\n"

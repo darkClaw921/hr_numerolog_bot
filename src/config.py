@@ -21,8 +21,12 @@ PREMIUM_USER_IDS = {int(x) for x in os.getenv("PREMIUM_USER_IDS", "").split(",")
 # Список Telegram ID администраторов (могут выдавать премиум командой /grant).
 ADMIN_USER_IDS = {int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()}
 
-# Стоимость подписки в рублях (для текста-оффера).
+# Стоимость подписки в рублях (для текста-оффера) — должна совпадать с `cost` подписки в Prodamus.
 SUBSCRIPTION_PRICE_RUB = int(os.getenv("SUBSCRIPTION_PRICE_RUB", "299"))
+# Цена первого платежа, если в подписке Prodamus задана скидка на первый платёж
+# (first_payment_discount). По умолчанию скидки нет — первый платёж равен обычной цене.
+# Пустое значение (как в .env.example) тоже означает «без скидки».
+SUBSCRIPTION_FIRST_PAYMENT_RUB = int(os.getenv("SUBSCRIPTION_FIRST_PAYMENT_RUB") or SUBSCRIPTION_PRICE_RUB)
 
 
 def _flag(name: str, default: str = "false") -> bool:

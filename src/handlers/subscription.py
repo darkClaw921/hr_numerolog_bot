@@ -22,7 +22,7 @@ from src.config import (
     BOT_USERNAME,
     PAYMENTS_ENABLED,
     PRODAMUS_TRIAL_DAYS,
-    SUBSCRIPTION_PRICE_RUB,
+    SUBSCRIPTION_FIRST_PAYMENT_RUB,
 )
 from src.db.models import BotUser
 from src.db.repositories import PaymentIntentRepo, PaymentRepo, SubscriptionRepo, UserRepo
@@ -87,7 +87,8 @@ async def render_subscription_screen(
         return
 
     order_id = _new_order_id(db_user)
-    await intent_repo.create(db_user.id, order_id, amount_rub=SUBSCRIPTION_PRICE_RUB)
+    # Сумма первого платежа — с учётом скидки подписки на первый месяц.
+    await intent_repo.create(db_user.id, order_id, amount_rub=SUBSCRIPTION_FIRST_PAYMENT_RUB)
     link = build_payment_link(
         order_id=order_id,
         telegram_id=db_user.telegram_id,

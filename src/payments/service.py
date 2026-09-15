@@ -3,6 +3,10 @@
 
 Функция `apply_notification` не знает про HTTP: её вызывает вебхук и тесты.
 Подпись к этому моменту уже проверена вызывающим кодом.
+
+Особенности формата Prodamus (сверено с реальным уведомлением):
+  * `order_id` — номер заказа Prodamus, а переданный ботом order_id приходит в `order_num`;
+  * даты без зоны (`date_next_payment` и т.п.) — московское время.
 """
 import hashlib
 import logging
@@ -13,11 +17,15 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import PRODAMUS_GRACE_DAYS, SUBSCRIPTION_PERIOD_DAYS
+from src.db.models import PaymentIntent
 from src.db.repositories import PaymentIntentRepo, PaymentRepo, SubscriptionRepo, UserRepo
 
 logger = logging.getLogger(__name__)
 
 SUCCESS_STATUS = "success"
+
+# Prodamus отдаёт даты без зоны в московском времени (поле `date` приходит с +03:00).
+PRODAMUS_TZ = timezone(timedelta(hours=3))
 
 # Что произошло — по этому полю вебхук решает, какое сообщение отправить пользователю.
 OUTCOME_ACTIVATED = "activated"
@@ -50,6 +58,11 @@ def _as_dict(value) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def order_ref(data: dict) -> str | None:
+    """Идентификатор заказа для логов: наш (order_num), иначе номер Prodamus (order_id)."""
+    return data.get("order_num") or data.get("order_id")
+
+
 def normalize_phone(phone: str | None) -> str | None:
     """'+7 (999) 888-77-66' -> '79998887766'; ведущая 8 приводится к 7."""
     if not phone:
@@ -63,7 +76,10 @@ def normalize_phone(phone: str | None) -> str | None:
 
 
 def parse_prodamus_datetime(value: str | None) -> datetime | None:
-    """Разбирает даты Prodamus ('2026-10-07 12:00:00' или ISO с зоной) в naive UTC."""
+    """
+    Разбирает даты Prodamus в naive UTC. Дата без зоны ('2026-10-07 12:00:00') —
+    московское время; ISO с зоной переводится по своей зоне.
+    """
     if not value:
         return None
     text = value.strip()
@@ -76,9 +92,9 @@ def parse_prodamus_datetime(value: str | None) -> datetime | None:
             parsed = parser(text)
         except ValueError:
             continue
-        if parsed.tzinfo is not None:
-            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
-        return parsed
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=PRODAMUS_TZ)
+        return parsed.astimezone(timezone.utc).replace(tzinfo=None)
     logger.warning("Prodamus: не удалось разобрать дату %r", value)
     return None
 
@@ -105,20 +121,32 @@ def _is_cancelled(subscription: dict) -> bool:
     return any(str(subscription.get(field, "1")) == "0" for field in ("active", "active_manager", "active_user"))
 
 
+async def _find_intent(session: AsyncSession, data: dict) -> PaymentIntent | None:
+    """
+    Намерение оплаты, выданное ботом. Prodamus возвращает наш order_id в `order_num`;
+    `order_id` проверяем на случай, если он придёт как есть.
+    """
+    intent_repo = PaymentIntentRepo(session)
+    for field in ("order_num", "order_id"):
+        value = data.get(field)
+        if value:
+            intent = await intent_repo.get_by_order_id(value)
+            if intent is not None:
+                return intent
+    return None
+
+
 async def _find_user(session: AsyncSession, data: dict) -> tuple[int | None, int | None]:
     """
     Ищет пользователя по (в порядке надёжности): выданному нами order_id,
     customer_extra, телефону, email. Возвращает (bot_users.id, telegram_id).
     """
     user_repo = UserRepo(session)
-    intent_repo = PaymentIntentRepo(session)
     sub_repo = SubscriptionRepo(session)
 
-    order_id = data.get("order_id")
-    if order_id:
-        intent = await intent_repo.get_by_order_id(order_id)
-        if intent is not None:
-            return intent.user_id, await _telegram_id_of(session, intent.user_id)
+    intent = await _find_intent(session, data)
+    if intent is not None:
+        return intent.user_id, await _telegram_id_of(session, intent.user_id)
 
     extra = data.get("customer_extra") or ""
     match = re.search(r"tg:(\d+)", str(extra))
@@ -162,15 +190,15 @@ def _to_amount(value) -> float | None:
 async def apply_notification(session: AsyncSession, data: dict, raw_body: str | None = None) -> ApplyResult:
     """Применяет проверенное уведомление Prodamus к БД. Не коммитит — это делает вызывающий."""
     subscription = _as_dict(data.get("subscription"))
-    order_id = data.get("order_id")
+    ref = order_ref(data)
     status = (data.get("payment_status") or "").strip().lower()
     payment_num = subscription.get("payment_num")
     event_key = build_event_key(data, raw_body)
 
     payment_repo = PaymentRepo(session)
     if await payment_repo.get_by_event_key(event_key) is not None:
-        logger.info("Prodamus: повторная доставка уведомления (order_id=%s)", order_id)
-        return ApplyResult(outcome=OUTCOME_DUPLICATE, order_id=order_id)
+        logger.info("Prodamus: повторная доставка уведомления (order=%s)", ref)
+        return ApplyResult(outcome=OUTCOME_DUPLICATE, order_id=ref)
 
     user_id, telegram_id = await _find_user(session, data)
     kind = "unknown"
@@ -180,7 +208,7 @@ async def apply_notification(session: AsyncSession, data: dict, raw_body: str | 
     payment = await payment_repo.add_event(
         user_id=user_id,
         event_key=event_key,
-        order_id=order_id,
+        order_id=data.get("order_id"),
         order_num=data.get("order_num"),
         amount_rub=_to_amount(data.get("sum")),
         status=status or None,
@@ -193,12 +221,12 @@ async def apply_notification(session: AsyncSession, data: dict, raw_body: str | 
     )
     if payment is None:
         # Гонка двух одновременных доставок — вторая проиграла уникальному индексу.
-        logger.info("Prodamus: дубль по event_key (order_id=%s)", order_id)
-        return ApplyResult(outcome=OUTCOME_DUPLICATE, order_id=order_id)
+        logger.info("Prodamus: дубль по event_key (order=%s)", ref)
+        return ApplyResult(outcome=OUTCOME_DUPLICATE, order_id=ref)
 
     if user_id is None:
-        logger.error("Prodamus: не удалось сопоставить пользователя (order_id=%s)", order_id)
-        return ApplyResult(outcome=OUTCOME_UNMATCHED, order_id=order_id)
+        logger.error("Prodamus: не удалось сопоставить пользователя (order=%s)", ref)
+        return ApplyResult(outcome=OUTCOME_UNMATCHED, order_id=ref)
 
     sub_repo = SubscriptionRepo(session)
 
@@ -225,11 +253,9 @@ async def apply_notification(session: AsyncSession, data: dict, raw_body: str | 
             customer_phone=normalize_phone(data.get("customer_phone")),
             customer_email=(data.get("customer_email") or None),
         )
-        intent_repo = PaymentIntentRepo(session)
-        if order_id:
-            intent = await intent_repo.get_by_order_id(order_id)
-            if intent is not None and intent.paid_at is None:
-                await intent_repo.mark_paid(intent)
+        intent = await _find_intent(session, data)
+        if intent is not None and intent.paid_at is None:
+            await PaymentIntentRepo(session).mark_paid(intent)
 
         if _is_cancelled(subscription):
             # Оплату засчитываем, но автопродление на стороне Prodamus уже отключено.
@@ -240,7 +266,7 @@ async def apply_notification(session: AsyncSession, data: dict, raw_body: str | 
             telegram_id=telegram_id,
             expires_at=expires_at,
             next_payment_at=next_payment_at,
-            order_id=order_id,
+            order_id=ref,
         )
 
     if subscription and _is_cancelled(subscription):
@@ -249,7 +275,7 @@ async def apply_notification(session: AsyncSession, data: dict, raw_body: str | 
             outcome=OUTCOME_CANCELLED,
             telegram_id=telegram_id,
             expires_at=sub.expires_at if sub is not None else None,
-            order_id=order_id,
+            order_id=ref,
         )
 
     if status and status != SUCCESS_STATUS:
@@ -260,9 +286,9 @@ async def apply_notification(session: AsyncSession, data: dict, raw_body: str | 
         return ApplyResult(
             outcome=OUTCOME_FAILED,
             telegram_id=telegram_id,
-            order_id=order_id,
+            order_id=ref,
             details=data.get("payment_status_description"),
             next_payment_at=parse_prodamus_datetime(subscription.get("date_next_payment")) if not exhausted else None,
         )
 
-    return ApplyResult(outcome=OUTCOME_IGNORED, telegram_id=telegram_id, order_id=order_id)
+    return ApplyResult(outcome=OUTCOME_IGNORED, telegram_id=telegram_id, order_id=ref)

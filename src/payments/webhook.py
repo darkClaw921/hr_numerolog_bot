@@ -88,6 +88,8 @@ async def _notify_user(bot: Bot, result: service.ApplyResult) -> None:
         await bot.send_message(result.telegram_id, text, parse_mode="HTML")
     except Exception:  # noqa: BLE001
         logger.exception("Не удалось отправить уведомление об оплате пользователю %s", result.telegram_id)
+        return
+    logger.info("Уведомление «%s» отправлено пользователю %s", result.outcome, result.telegram_id)
 
 
 async def handle_notification(request: web.Request) -> web.Response:
