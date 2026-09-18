@@ -3,7 +3,7 @@
 """
 from datetime import date, datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,6 +13,7 @@ from src.db.models import (
     Payment,
     PaymentIntent,
     Person,
+    Referral,
     SearchHistory,
     Subscription,
 )
@@ -97,6 +98,16 @@ class PersonRepo:
         )
         return list(result.scalars().all())
 
+    async def find_by_birth_date(self, owner_user_id: int, birth_date: date) -> Person | None:
+        """Последний сохранённый человек с этой датой — чтобы не предлагать сохранить повторно."""
+        result = await self.session.execute(
+            select(Person)
+            .where(Person.owner_user_id == owner_user_id, Person.birth_date == birth_date)
+            .order_by(Person.created_at.desc(), Person.id.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
     async def get(self, person_id: int, owner_user_id: int) -> Person | None:
         result = await self.session.execute(
             select(Person).where(
@@ -132,10 +143,34 @@ class SearchHistoryRepo:
         result = await self.session.execute(
             select(SearchHistory)
             .where(SearchHistory.user_id == user_id)
-            .order_by(SearchHistory.created_at.desc())
+            .order_by(SearchHistory.created_at.desc(), SearchHistory.id.desc())
             .limit(limit)
         )
         return list(result.scalars().all())
+
+    async def list_unique(self, user_id: int, limit: int = 15) -> "list[tuple[SearchHistory, Person | None]]":
+        """
+        Кого искал — без повторов: последний поиск по каждому человеку/дате.
+        Возвращает пары (запись истории, сохранённый человек или None).
+        """
+        result = await self.session.execute(
+            select(SearchHistory, Person)
+            .outerjoin(Person, Person.id == SearchHistory.person_id)
+            .where(SearchHistory.user_id == user_id)
+            .order_by(SearchHistory.created_at.desc(), SearchHistory.id.desc())
+            .limit(limit * 10)
+        )
+        seen: set = set()
+        items = []
+        for item, person in result.all():
+            key = ("p", person.id) if person is not None else ("d", item.birth_date)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append((item, person))
+            if len(items) >= limit:
+                break
+        return items
 
 
 class SubscriptionRepo:
@@ -236,6 +271,57 @@ class SubscriptionRepo:
         await self.session.flush()
         return sub
 
+    async def add_bonus_days(self, user_id: int, days: int) -> Subscription:
+        """
+        Продлевает доступ на `days` дней (реферальный бонус).
+
+        Активная подписка продлевается от конца оплаченного периода, неактивная —
+        включается с «сейчас». Бессрочный премиум (expires_at IS NULL) не меняется.
+        """
+        sub = await self.get(user_id)
+        now = _utcnow()
+        if sub is None:
+            sub = Subscription(user_id=user_id, is_premium=True, plan="referral_bonus", started_at=now,
+                               expires_at=now + timedelta(days=days))
+            self.session.add(sub)
+            await self.session.flush()
+            return sub
+        active = await self.is_active(user_id)
+        if active and sub.expires_at is None:
+            return sub
+        base = sub.expires_at.replace(tzinfo=None) if active else now
+        if not active:
+            sub.is_premium = True
+            sub.started_at = now
+            if not sub.provider:
+                sub.plan = "referral_bonus"
+        sub.expires_at = base + timedelta(days=days)
+        await self.session.flush()
+        return sub
+
+    async def shift_next_payment(self, user_id: int, next_payment_at: datetime, grace_days: int = 0) -> None:
+        """
+        Фиксирует перенесённую в Prodamus дату следующего списания: доступ тянется до
+        новой даты (+ запас), отложенные бонусные дни считаются выданными.
+        """
+        sub = await self.get(user_id)
+        if sub is None:
+            return
+        sub.next_payment_at = next_payment_at
+        sub.referral_bonus_pending_days = None
+        until = next_payment_at + timedelta(days=grace_days)
+        current = sub.expires_at.replace(tzinfo=None) if sub.expires_at is not None else None
+        if current is not None and current < until:
+            sub.expires_at = until
+        await self.session.flush()
+
+    async def add_pending_bonus(self, user_id: int, days: int) -> None:
+        """Бонусные дни, которые не удалось отразить переносом списания в Prodamus (повторим позже)."""
+        sub = await self.get(user_id)
+        if sub is not None:
+            sub.referral_bonus_pending_days = (sub.referral_bonus_pending_days or 0) + days
+            await self.session.flush()
+
     async def find_by_phone(self, phone: str) -> Subscription | None:
         result = await self.session.execute(
             select(Subscription).where(Subscription.prodamus_customer_phone == phone)
@@ -306,6 +392,53 @@ class PaymentRepo:
             .limit(limit)
         )
         return list(result.scalars().all())
+
+
+class ReferralRepo:
+    """Реферальные приглашения и начисление бонусов пригласившему."""
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def get_by_referred(self, referred_user_id: int) -> Referral | None:
+        result = await self.session.execute(
+            select(Referral).where(Referral.referred_user_id == referred_user_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def attach(self, referrer_user_id: int, referred_user_id: int) -> Referral | None:
+        """Привязывает приглашённого к пригласившему. None — уже привязан или сам себя."""
+        if referrer_user_id == referred_user_id:
+            return None
+        if await self.get_by_referred(referred_user_id) is not None:
+            return None
+        referral = Referral(referrer_user_id=referrer_user_id, referred_user_id=referred_user_id)
+        try:
+            # SAVEPOINT: при конфликте откатываем только вставку, а не всю сессию апдейта
+            # (полный rollback «протух» бы db_user и прочие объекты хендлера).
+            async with self.session.begin_nested():
+                self.session.add(referral)
+        except IntegrityError:
+            # Гонка двух /start с разными ссылками: побеждает первая.
+            return None
+        return referral
+
+    async def mark_rewarded(self, referral: Referral, days: int) -> None:
+        referral.rewarded_at = _utcnow()
+        referral.bonus_days = days
+        await self.session.flush()
+
+    async def stats(self, referrer_user_id: int) -> dict:
+        """Сколько приглашено, сколько оплатило и сколько бонусных дней получено."""
+        result = await self.session.execute(
+            select(
+                func.count(Referral.id),
+                func.count(Referral.rewarded_at),
+                func.coalesce(func.sum(Referral.bonus_days), 0),
+            ).where(Referral.referrer_user_id == referrer_user_id)
+        )
+        invited, paid, bonus_days = result.one()
+        return {"invited": invited, "paid": paid, "bonus_days": int(bonus_days or 0)}
 
 
 class CompatibilityRepo:

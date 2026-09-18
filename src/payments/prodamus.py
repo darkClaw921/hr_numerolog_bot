@@ -21,7 +21,7 @@ from src.payments.hmac_sign import create_signature
 
 logger = logging.getLogger(__name__)
 
-# Таймаут REST-вызовов: подписи считаются локально, сеть нужна только для setActivity.
+# Таймаут REST-вызовов: подписи считаются локально, сеть нужна только для REST-методов.
 _REST_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 
@@ -108,17 +108,44 @@ async def set_activity(
     if active_user is not None:
         # Пользователь может только отписаться — обратная активация только менеджером.
         data["active_user"] = "1" if active_user else "0"
-    data["signature"] = create_signature(data, PRODAMUS_SECRET_KEY)
+    return await _rest_call("setActivity", data)
 
-    url = f"{PRODAMUS_FORM_URL}/rest/setActivity/"
+
+async def set_payment_date(
+    *,
+    customer_phone: str,
+    payment_date: datetime,
+    subscription_id: str | None = None,
+) -> dict:
+    """
+    Переносит дату следующего списания (REST-метод setSubscriptionPaymentDate).
+
+    Prodamus позволяет сдвигать дату только вперёд; клиента идентифицируем по телефону
+    (tg_user_id и email этот метод не поддерживает). `payment_date` — naive UTC,
+    Prodamus ждёт московское время в формате `YYYY-MM-DD HH:MM`.
+    """
+    msk = payment_date.replace(tzinfo=timezone.utc).astimezone(timezone(timedelta(hours=3)))
+    data: dict[str, str] = {
+        "subscription": subscription_id or PRODAMUS_SUBSCRIPTION_ID,
+        "auth_type": "customer_phone",
+        "customer_phone": "+" + customer_phone.lstrip("+"),
+        "date": msk.strftime("%Y-%m-%d %H:%M"),
+    }
+    return await _rest_call("setSubscriptionPaymentDate", data)
+
+
+async def _rest_call(method: str, data: dict[str, str]) -> dict:
+    """Подписывает и отправляет REST-запрос. Не бросает исключений: {"ok", "status", "body"}."""
+    data["signature"] = create_signature(data, PRODAMUS_SECRET_KEY)
+    url = f"{PRODAMUS_FORM_URL}/rest/{method}/"
     try:
         async with aiohttp.ClientSession(timeout=_REST_TIMEOUT) as session:
             async with session.post(url, data=data) as response:
                 body = await response.text()
                 ok = response.status == 200
                 if not ok:
-                    logger.warning("Prodamus setActivity: HTTP %s, ответ: %s", response.status, body[:500])
+                    logger.warning("Prodamus %s: HTTP %s, ответ: %s", method, response.status, body[:500])
                 return {"ok": ok, "status": response.status, "body": body}
     except Exception as exc:  # noqa: BLE001 — сеть не должна ронять хендлер
-        logger.exception("Prodamus setActivity: запрос не удался")
+        logger.exception("Prodamus %s: запрос не удался", method)
         return {"ok": False, "status": 0, "body": str(exc)}

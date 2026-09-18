@@ -16,9 +16,15 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.config import PRODAMUS_GRACE_DAYS, SUBSCRIPTION_PERIOD_DAYS
-from src.db.models import PaymentIntent
-from src.db.repositories import PaymentIntentRepo, PaymentRepo, SubscriptionRepo, UserRepo
+from src.config import PRODAMUS_GRACE_DAYS, REFERRAL_BONUS_DAYS, SUBSCRIPTION_PERIOD_DAYS
+from src.db.models import BotUser, PaymentIntent
+from src.db.repositories import (
+    PaymentIntentRepo,
+    PaymentRepo,
+    ReferralRepo,
+    SubscriptionRepo,
+    UserRepo,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +44,22 @@ OUTCOME_IGNORED = "ignored"
 
 
 @dataclass
+class ReferralReward:
+    """Бонус пригласившему за первую оплату друга (уведомление и перенос списания — после коммита)."""
+
+    user_id: int
+    telegram_id: int | None
+    days: int
+    expires_at: datetime | None  # None — бессрочный доступ, дни не понадобились
+    # Если у пригласившего действует автопродление — дату списания нужно сдвинуть в Prodamus.
+    shift_phone: str | None = None
+    shift_subscription_id: str | None = None
+    shift_to: datetime | None = None
+    # Повтор ранее не удавшегося переноса (без уведомления и без нового начисления).
+    retry: bool = False
+
+
+@dataclass
 class ApplyResult:
     """Итог обработки одного уведомления."""
 
@@ -47,6 +69,9 @@ class ApplyResult:
     next_payment_at: datetime | None = None
     order_id: str | None = None
     details: str | None = None
+    referral_reward: ReferralReward | None = None
+    # Повтор переноса списания для отложенных реферальных дней самого плательщика.
+    pending_shift: ReferralReward | None = None
 
 
 def _utcnow() -> datetime:
@@ -174,8 +199,6 @@ async def _find_user(session: AsyncSession, data: dict) -> tuple[int | None, int
 async def _telegram_id_of(session: AsyncSession, user_id: int | None) -> int | None:
     if user_id is None:
         return None
-    from src.db.models import BotUser
-
     user = await session.get(BotUser, user_id)
     return user.telegram_id if user is not None else None
 
@@ -244,6 +267,9 @@ async def apply_notification(session: AsyncSession, data: dict, raw_body: str | 
                 base = base.replace(tzinfo=None)
             start = max(base, _utcnow()) if base is not None else _utcnow()
             expires_at = start + timedelta(days=SUBSCRIPTION_PERIOD_DAYS)
+        if current is not None and current.expires_at is not None:
+            # Не укорачиваем уже выданный доступ (например, реферальные бонусные дни).
+            expires_at = max(expires_at, current.expires_at.replace(tzinfo=None))
 
         await sub_repo.apply_prodamus_payment(
             user_id,
@@ -261,12 +287,20 @@ async def apply_notification(session: AsyncSession, data: dict, raw_body: str | 
             # Оплату засчитываем, но автопродление на стороне Prodamus уже отключено.
             await sub_repo.mark_cancelled(user_id)
 
+        # Бонус — только за реальную оплату: при пробном периоде первое уведомление может
+        # прийти с нулевой суммой.
+        amount = _to_amount(data.get("sum")) or 0
+        reward = await _reward_referrer(session, user_id) if kind == "initial" and amount > 0 else None
+        pending_shift = await _pending_shift(session, user_id)
+
         return ApplyResult(
             outcome=OUTCOME_ACTIVATED if kind == "initial" else OUTCOME_RENEWED,
             telegram_id=telegram_id,
             expires_at=expires_at,
             next_payment_at=next_payment_at,
             order_id=ref,
+            referral_reward=reward,
+            pending_shift=pending_shift,
         )
 
     if subscription and _is_cancelled(subscription):
@@ -292,3 +326,69 @@ async def apply_notification(session: AsyncSession, data: dict, raw_body: str | 
         )
 
     return ApplyResult(outcome=OUTCOME_IGNORED, telegram_id=telegram_id, order_id=ref)
+
+
+async def _reward_referrer(session: AsyncSession, user_id: int) -> ReferralReward | None:
+    """
+    Начисляет пригласившему бонусные дни за первую оплату приглашённого (один раз).
+
+    Доступ продлевается сразу в БД. Если у пригласившего идёт автопродление, дату
+    списания в Prodamus нужно сдвинуть на те же дни — это сетевой вызов, его делает
+    вебхук после коммита (см. ReferralReward.shift_*).
+    """
+    referral_repo = ReferralRepo(session)
+    referral = await referral_repo.get_by_referred(user_id)
+    if referral is None or referral.rewarded_at is not None or REFERRAL_BONUS_DAYS <= 0:
+        return None
+
+    sub_repo = SubscriptionRepo(session)
+    referrer_id = referral.referrer_user_id
+    before = await sub_repo.get(referrer_id)
+    lifetime = before is not None and before.expires_at is None and await sub_repo.is_active(referrer_id)
+    sub = await sub_repo.add_bonus_days(referrer_id, REFERRAL_BONUS_DAYS)
+    await referral_repo.mark_rewarded(referral, REFERRAL_BONUS_DAYS if not lifetime else 0)
+
+    reward = ReferralReward(
+        user_id=referrer_id,
+        telegram_id=await _telegram_id_of(session, referrer_id),
+        days=REFERRAL_BONUS_DAYS,
+        expires_at=None if lifetime else sub.expires_at,
+    )
+    if not lifetime and _has_upcoming_charge(sub):
+        reward.shift_phone = sub.prodamus_customer_phone
+        reward.shift_subscription_id = sub.prodamus_subscription_id
+        reward.shift_to = sub.next_payment_at.replace(tzinfo=None) + timedelta(days=REFERRAL_BONUS_DAYS)
+    logger.info("Реферальный бонус: user=%s +%s дн. (за user=%s)", referrer_id, REFERRAL_BONUS_DAYS, user_id)
+    return reward
+
+
+def _has_upcoming_charge(sub) -> bool:
+    """
+    Идёт ли автопродление с будущей датой списания. Дату в прошлом (подписка
+    «зависла» после неудачных списаний) Prodamus не даст сдвинуть — не пытаемся.
+    """
+    return bool(
+        sub is not None
+        and sub.prodamus_active
+        and sub.prodamus_customer_phone
+        and sub.next_payment_at is not None
+        and sub.next_payment_at.replace(tzinfo=None) > _utcnow()
+    )
+
+
+async def _pending_shift(session: AsyncSession, user_id: int) -> ReferralReward | None:
+    """Если у плательщика есть отложенные реферальные дни — повторяем перенос списания."""
+    sub = await SubscriptionRepo(session).get(user_id)
+    days = sub.referral_bonus_pending_days if sub is not None else None
+    if not days or not _has_upcoming_charge(sub):
+        return None
+    return ReferralReward(
+        user_id=user_id,
+        telegram_id=None,
+        days=days,
+        expires_at=sub.expires_at,
+        shift_phone=sub.prodamus_customer_phone,
+        shift_subscription_id=sub.prodamus_subscription_id,
+        shift_to=sub.next_payment_at.replace(tzinfo=None) + timedelta(days=days),
+        retry=True,
+    )

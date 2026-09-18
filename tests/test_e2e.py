@@ -30,7 +30,8 @@ from src.db.repositories import (  # noqa: E402
     SubscriptionRepo,
     UserRepo,
 )
-from src.handlers import cabinet, calculation, combinations, common, report, subscription  # noqa: E402
+from src import admin_mode  # noqa: E402
+from src.handlers import admin, cabinet, calculation, combinations, common, report, subscription  # noqa: E402
 
 USER_ID = 555
 ADMIN_ID = 555  # тот же пользователь — админ (для /grant самому себе)
@@ -47,6 +48,8 @@ class FakeSession(BaseSession):
     async def make_request(self, bot, method, timeout=None):
         self.requests.append(method)
         name = type(method).__name__
+        if name == "GetMe":
+            return User(id=1, is_bot=True, first_name="bot", username="numbot")
         if name in ("SendMessage", "SendDocument", "EditMessageText", "SendPhoto"):
             self._mid += 1
             return Message(
@@ -94,7 +97,7 @@ class E2EBase(unittest.IsolatedAsyncioTestCase):
         self._patch_factory = patch("src.db.middleware.async_session_factory", self.factory)
         self._patch_factory.start()
         # Делаем тестового пользователя админом для /grant.
-        self._patch_admin = patch("src.handlers.subscription.ADMIN_USER_IDS", {ADMIN_ID})
+        self._patch_admin = patch("src.admin_mode.ADMIN_USER_IDS", {ADMIN_ID})
         self._patch_admin.start()
 
         self.session = FakeSession()
@@ -104,9 +107,10 @@ class E2EBase(unittest.IsolatedAsyncioTestCase):
         self.dp = Dispatcher(storage=MemoryStorage())
         self.dp.update.middleware(DbSessionMiddleware())
         # Роутеры — модульные синглтоны; сбрасываем привязку к прошлому Dispatcher.
-        for m in (common, subscription, cabinet, calculation, combinations, report):
+        admin_mode.reset_all()
+        for m in (common, admin, subscription, cabinet, calculation, combinations, report):
             m.router._parent_router = None
-        for m in (common, subscription, cabinet, calculation, combinations, report):
+        for m in (common, admin, subscription, cabinet, calculation, combinations, report):
             self.dp.include_router(m.router)
 
         self.user = User(id=USER_ID, is_bot=False, first_name="Тест", username="tester")
@@ -118,6 +122,7 @@ class E2EBase(unittest.IsolatedAsyncioTestCase):
         await self.engine.dispose()
         self._patch_factory.stop()
         self._patch_admin.stop()
+        admin_mode.reset_all()
         os.unlink(self._tmp.name)
 
     def _next_update_id(self):

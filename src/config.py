@@ -56,6 +56,9 @@ PRODAMUS_WEBHOOK_PORT = int(os.getenv("PRODAMUS_WEBHOOK_PORT", "8080"))
 
 # Длительность оплаченного периода, если Prodamus не прислал date_next_payment.
 SUBSCRIPTION_PERIOD_DAYS = int(os.getenv("SUBSCRIPTION_PERIOD_DAYS", "31"))
+# Реферальная программа: +N дней премиума пригласившему за каждого оплатившего друга.
+REFERRAL_BONUS_DAYS = int(os.getenv("REFERRAL_BONUS_DAYS", "10"))
+
 # Username бота без @ — на него ведут urlSuccess/urlReturn, чтобы вернуть пользователя в бот.
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@")
 

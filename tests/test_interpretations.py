@@ -87,8 +87,8 @@ class TestPurposeStability(unittest.TestCase):
     def test_purpose_energy_note_added_on_low_energy(self):
         with_note = it.get_purpose_interpretation(6, 0)
         without_note = it.get_purpose_interpretation(6, 3)
-        self.assertIn("дефиците энергии", with_note)
-        self.assertNotIn("дефиците энергии", without_note)
+        self.assertIn("У этого человека дефицит энергии", with_note)
+        self.assertNotIn("У этого человека дефицит энергии", without_note)
 
     def test_stability_buckets_nonempty(self):
         for n in (1, 4, 6):
