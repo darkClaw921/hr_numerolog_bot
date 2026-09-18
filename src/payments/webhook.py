@@ -8,6 +8,7 @@ Prodamus шлёт уведомления POST-запросом в multipart/form
 Живёт в том же процессе, что и long polling: aiohttp-приложение поднимается через
 AppRunner в `src.bot.main()`. Наружу путь вебхука проксирует reverse proxy по HTTPS.
 """
+import asyncio
 import logging
 import time
 from collections import defaultdict, deque
@@ -17,14 +18,18 @@ from aiogram import Bot
 from aiohttp import web
 
 from src.config import (
+    PRODAMUS_GRACE_DAYS,
     PRODAMUS_SECRET_KEY,
     PRODAMUS_WEBHOOK_PATH,
 )
+from src.db.repositories import SubscriptionRepo
 from src.db.session import async_session_factory
-from src.payments import service
+from src.payments import prodamus, service
 from src.payments.formdata import parse_php_pairs
 from src.payments.hmac_sign import verify_signature
 from src.texts import (
+    REFERRAL_REWARD_NOTIFY,
+    REFERRAL_REWARD_NOTIFY_LIFETIME,
     SUB_NOTIFY_ACTIVATED,
     SUB_NOTIFY_CANCELLED,
     SUB_NOTIFY_FAILED,
@@ -92,6 +97,59 @@ async def _notify_user(bot: Bot, result: service.ApplyResult) -> None:
     logger.info("Уведомление «%s» отправлено пользователю %s", result.outcome, result.telegram_id)
 
 
+async def _apply_referral_reward(bot: Bot | None, reward: service.ReferralReward) -> None:
+    """
+    После коммита: сдвигает дату автосписания в Prodamus на бонусные дни и сообщает о бонусе.
+
+    Без переноса бонус «съел» бы очередной оплаченный период: доступ считается от даты
+    списания. Если перенос не удался, дни записываются в отложенные и перенос повторяется
+    при следующем успешном списании (ApplyResult.pending_shift).
+    """
+    if reward.shift_to is not None and reward.shift_phone:
+        response = await prodamus.set_payment_date(
+            customer_phone=reward.shift_phone,
+            payment_date=reward.shift_to,
+            subscription_id=reward.shift_subscription_id,
+        )
+        try:
+            async with async_session_factory() as session:
+                repo = SubscriptionRepo(session)
+                if response.get("ok"):
+                    await repo.shift_next_payment(reward.user_id, reward.shift_to, PRODAMUS_GRACE_DAYS)
+                elif not reward.retry:
+                    await repo.add_pending_bonus(reward.user_id, reward.days)
+                await session.commit()
+        except Exception:  # noqa: BLE001
+            logger.exception("Не удалось сохранить перенос списания user=%s", reward.user_id)
+        if not response.get("ok"):
+            logger.error(
+                "Prodamus: не удалось перенести дату списания на %s дн. (user=%s) — повторим при следующем списании",
+                reward.days,
+                reward.user_id,
+            )
+
+    if bot is None or reward.telegram_id is None:
+        return
+    if reward.expires_at is None:
+        text = REFERRAL_REWARD_NOTIFY_LIFETIME
+    else:
+        text = REFERRAL_REWARD_NOTIFY.format(days=reward.days, expires=_format_date(reward.expires_at))
+    try:
+        await bot.send_message(reward.telegram_id, text, parse_mode="HTML")
+    except Exception:  # noqa: BLE001
+        logger.exception("Не удалось уведомить о реферальном бонусе пользователя %s", reward.telegram_id)
+
+
+# Ссылки на фоновые задачи, чтобы сборщик мусора не прервал их до завершения.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _run_in_background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 async def handle_notification(request: web.Request) -> web.Response:
     """POST-уведомление Prodamus: проверяет подпись и применяет событие к подписке."""
     ip = request.headers.get("X-Forwarded-For", request.remote or "").split(",")[0].strip()
@@ -141,6 +199,11 @@ async def handle_notification(request: web.Request) -> web.Response:
         result.outcome,
     )
     await _notify_user(request.app.get(BOT_KEY), result)
+    # REST-вызовы Prodamus (до 15 с) — в фоне: ответ на вебхук не должен их ждать,
+    # иначе Prodamus сочтёт доставку неудачной и повторит её.
+    for reward in (result.referral_reward, result.pending_shift):
+        if reward is not None:
+            _run_in_background(_apply_referral_reward(request.app.get(BOT_KEY), reward))
     return web.Response(status=200, text="OK")
 
 

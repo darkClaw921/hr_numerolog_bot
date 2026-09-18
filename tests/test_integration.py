@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # no
 from src.access import require_premium  # noqa: E402
 from src.db.base import Base  # noqa: E402
 from src.db.repositories import (  # noqa: E402
+    PersonRepo,
     SearchHistoryRepo,
     SubscriptionRepo,
     UserRepo,
@@ -52,7 +53,7 @@ class TestProcessDate(unittest.IsolatedAsyncioTestCase):
             db_user = await UserRepo(s).get_or_create(telegram_id=777, first_name="T")
             await s.commit()
             msg = StubMessage("18.08.1984", user_id=777)
-            await process_date(msg, SubscriptionRepo(s), SearchHistoryRepo(s), db_user)
+            await process_date(msg, SubscriptionRepo(s), SearchHistoryRepo(s), PersonRepo(s), db_user)
             await s.commit()
 
             # Отправлен экран результатов с клавиатурой.
@@ -72,7 +73,7 @@ class TestProcessDate(unittest.IsolatedAsyncioTestCase):
             db_user = await UserRepo(s).get_or_create(telegram_id=778)
             await s.commit()
             msg = StubMessage("18.08.1984", user_id=778)
-            await process_date(msg, SubscriptionRepo(s), SearchHistoryRepo(s), db_user)
+            await process_date(msg, SubscriptionRepo(s), SearchHistoryRepo(s), PersonRepo(s), db_user)
             _, keyboard = msg.sent[0]
             all_texts = " ".join(btn.text for row in keyboard.inline_keyboard for btn in row)
             self.assertIn("🔒", all_texts)  # платные кнопки помечены замком
@@ -83,7 +84,7 @@ class TestProcessDate(unittest.IsolatedAsyncioTestCase):
             await SubscriptionRepo(s).set_premium(db_user.id, days=30)
             await s.commit()
             msg = StubMessage("18.08.1984", user_id=779)
-            await process_date(msg, SubscriptionRepo(s), SearchHistoryRepo(s), db_user)
+            await process_date(msg, SubscriptionRepo(s), SearchHistoryRepo(s), PersonRepo(s), db_user)
             _, keyboard = msg.sent[0]
             all_texts = " ".join(btn.text for row in keyboard.inline_keyboard for btn in row)
             self.assertNotIn("🔒", all_texts)

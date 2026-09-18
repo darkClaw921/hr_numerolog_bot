@@ -46,8 +46,13 @@ class TestFullReport(unittest.TestCase):
         self.assertEqual(self.html.count("Сектор "), 18)  # 9 в матрице + 9 в блоке секторов
 
     def test_contains_all_qualities(self):
-        for q in ["БЫТ", "СЕМЬЯ", "СТАБИЛЬНОСТЬ", "ЦЕЛЕУСТРЕМЛЕННОСТЬ", "ТРАНСФОРМАЦИЯ", "ЧИСЛО СУДЬБЫ"]:
+        for q in ["БЫТ", "ТЕМПЕРАМЕНТ", "СЕМЬЯ", "ПРИВЫЧКИ/СТАБИЛЬНОСТЬ", "ЦЕЛЕУСТРЕМЛЕННОСТЬ", "ЧИСЛО СУДЬБЫ"]:
             self.assertIn(q, self.html)
+
+    def test_transformation_hidden(self):
+        # ТЗ 06, п. 11: «Трансформация» скрыта — в том числе из полного отчёта.
+        self.assertNotIn("ТРАНСФОРМАЦИЯ", self.html)
+        self.assertNotIn("ПЛОТСКОЕ", self.html)
 
     def test_markdown_has_no_html_tags(self):
         self.assertIsNone(re.search(r"</?[a-zA-Z][^>]*>", self.md))

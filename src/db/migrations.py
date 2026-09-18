@@ -20,6 +20,8 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "next_payment_at": "DATETIME",
         "last_payment_at": "DATETIME",
         "cancelled_at": "DATETIME",
+        # Реферальная программа (ТЗ 06).
+        "referral_bonus_pending_days": "INTEGER",
     },
 }
 

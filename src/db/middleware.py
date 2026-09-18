@@ -11,6 +11,7 @@ from src.db.repositories import (
     PaymentIntentRepo,
     PaymentRepo,
     PersonRepo,
+    ReferralRepo,
     SearchHistoryRepo,
     SubscriptionRepo,
     UserRepo,
@@ -46,6 +47,7 @@ class DbSessionMiddleware(BaseMiddleware):
             data["subscription_repo"] = SubscriptionRepo(session)
             data["intent_repo"] = PaymentIntentRepo(session)
             data["payment_repo"] = PaymentRepo(session)
+            data["referral_repo"] = ReferralRepo(session)
 
             tg_user = data.get("event_from_user")
             if tg_user is None and isinstance(event, Update):

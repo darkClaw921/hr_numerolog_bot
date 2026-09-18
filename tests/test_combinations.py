@@ -4,7 +4,7 @@ import unittest
 from src.utils import combinations as c
 
 
-def make_results(counts=None, family=0, life=0, temperament=0, purpose=0, destiny=1):
+def make_results(counts=None, family=0, life=0, temperament=0, purpose=0, stability=0, destiny=1):
     """Строит синтетический results-словарь с заданными количествами цифр в секторах."""
     counts = counts or {}
     matrix = {i: [i] * counts.get(i, 0) for i in range(1, 10)}
@@ -14,6 +14,7 @@ def make_results(counts=None, family=0, life=0, temperament=0, purpose=0, destin
         "sector_life": life,
         "sector_temperament": temperament,
         "sector_purpose": purpose,
+        "sector_stability": stability,
         "destiny_number": destiny,
     }
 

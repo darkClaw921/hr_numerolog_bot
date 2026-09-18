@@ -10,7 +10,8 @@ from datetime import datetime, date
 
 # Версия алгоритма расчёта. Хранится вместе со снапшотом результата в БД, чтобы
 # бот совместимости мог определить устаревший кэш и пересчитать из даты рождения.
-CALC_VERSION = 1
+# v2: добавлен коэффициент «Привычки/Стабильность» (sector_stability, 3/6/9).
+CALC_VERSION = 2
 
 # Ключи коэффициентов секторов, которые обязаны присутствовать в результате.
 REQUIRED_COEF_KEYS = (
@@ -18,6 +19,7 @@ REQUIRED_COEF_KEYS = (
     "sector_life",
     "sector_purpose",
     "sector_family",
+    "sector_stability",
 )
 
 
@@ -249,6 +251,9 @@ def calculate_all(date_str: str) -> Dict:
     # Шаг 9: Сектор семья (2/5/8)
     sector_family = calculate_sector_coefficient(matrix, [2, 5, 8])
     
+    # Шаг 9.1: Сектор привычки/стабильность (3/6/9)
+    sector_stability = calculate_sector_coefficient(matrix, [3, 6, 9])
+
     # Шаг 10: Число Судьбы
     destiny_number = calculate_destiny_number(date_str)
     
@@ -263,6 +268,7 @@ def calculate_all(date_str: str) -> Dict:
         "sector_life": sector_life,
         "sector_purpose": sector_purpose,
         "sector_family": sector_family,
+        "sector_stability": sector_stability,
         "destiny_number": destiny_number
     }
 

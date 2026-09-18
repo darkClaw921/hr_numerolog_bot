@@ -8,9 +8,11 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import BotCommandScopeChat, MenuButtonCommands
 from aiohttp import web
 
 from src.config import (
+    ADMIN_USER_IDS,
     BOT_TOKEN,
     PAYMENTS_ENABLED,
     PRODAMUS_WEBHOOK_HOST,
@@ -19,7 +21,7 @@ from src.config import (
 )
 from src.db.middleware import DbSessionMiddleware
 from src.db.session import init_models
-from src.handlers import cabinet, calculation, combinations, common, report, subscription
+from src.handlers import admin, cabinet, calculation, combinations, common, report, subscription
 from src.payments.webhook import create_webhook_app
 
 logging.basicConfig(
@@ -49,6 +51,7 @@ async def main():
     # Порядок важен: cabinet (FSM-хендлеры) регистрируется до calculation,
     # чтобы во время ввода в FSM дата не перехватывалась общим обработчиком даты.
     dp.include_router(common.router)
+    dp.include_router(admin.router)
     dp.include_router(subscription.router)
     dp.include_router(cabinet.router)
     dp.include_router(calculation.router)
@@ -69,6 +72,19 @@ async def main():
             PRODAMUS_WEBHOOK_PORT,
             PRODAMUS_WEBHOOK_PATH,
         )
+
+    # Кнопка «Меню» в Telegram: /start и /menu (ТЗ 06, п. 2). Сбой сети не должен мешать запуску.
+    try:
+        await bot.set_my_commands(common.BOT_COMMANDS)
+        await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    except Exception:  # noqa: BLE001
+        logger.exception("Не удалось установить меню команд")
+    # Админам в меню добавляется /admin (переключение режима проверки).
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await bot.set_my_commands(common.ADMIN_BOT_COMMANDS, scope=BotCommandScopeChat(chat_id=admin_id))
+        except Exception:  # noqa: BLE001 — админ мог ещё не открывать бота
+            logger.warning("Не удалось установить меню команд админа %s", admin_id)
 
     logger.info("Бот запущен")
     try:

@@ -147,6 +147,9 @@ class Subscription(Base):
     next_payment_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_payment_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Реферальные дни, на которые не удалось сдвинуть автосписание в Prodamus: перенос
+    # повторяется при следующем успешном списании, иначе дни «съест» оплаченный период.
+    referral_bonus_pending_days: Mapped[int | None] = mapped_column(Integer)
 
     user: Mapped["BotUser"] = relationship(back_populates="subscription")
 
@@ -235,4 +238,32 @@ class Payment(Base):
         UniqueConstraint("event_key", name="uq_payments_event_key"),
         Index("ix_payments_user_created", "user_id", "created_at"),
         Index("ix_payments_order_id", "order_id"),
+    )
+
+
+class Referral(Base):
+    """
+    Приглашение по реферальной ссылке: кто кого привёл и выдан ли бонус.
+
+    Один приглашённый — один реферер (unique). Бонус выдаётся один раз, при первом
+    успешном платеже приглашённого; `rewarded_at` защищает от повторного начисления.
+    """
+
+    __tablename__ = "referrals"
+
+    id: Mapped[int] = mapped_column(PkType, primary_key=True, autoincrement=True)
+    referrer_user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("bot_users.id", ondelete="CASCADE"), nullable=False
+    )
+    referred_user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("bot_users.id", ondelete="CASCADE"), nullable=False
+    )
+    bonus_days: Mapped[int | None] = mapped_column(Integer)
+    rewarded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("referred_user_id", name="uq_referrals_referred"),
+        CheckConstraint("referrer_user_id <> referred_user_id", name="referral_not_self"),
+        Index("ix_referrals_referrer", "referrer_user_id"),
     )
